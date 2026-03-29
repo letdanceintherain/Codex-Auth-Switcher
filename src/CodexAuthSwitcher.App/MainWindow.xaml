@@ -7,6 +7,7 @@
         xmlns:vm="clr-namespace:CodexAuthSwitcher.App.ViewModels"
         mc:Ignorable="d"
         Title="{Binding Source={x:Static app:App.Localization}, Path=[Window.Main.Title]}"
+        Icon="Assets/AppIcon.ico"
         Width="1220"
         Height="780"
         MinWidth="1080"

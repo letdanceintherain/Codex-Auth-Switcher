@@ -31,6 +31,7 @@ SolidCompression=yes
 WizardStyle=modern
 UsePreviousAppDir=no
 CloseApplications=yes
+SetupIconFile=..\src\CodexAuthSwitcher.App\Assets\AppIcon.ico
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
