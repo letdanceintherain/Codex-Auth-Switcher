@@ -1,0 +1,20 @@
+# Build output
+artifacts/
+src/**/bin/
+src/**/obj/
+tests/**/bin/
+tests/**/obj/
+
+# IDE and local tooling
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Logs and handoff notes
+THREAD_*_LOG_*.md
+
+# OS files
+Thumbs.db
+Desktop.ini
