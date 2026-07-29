@@ -92,12 +92,6 @@
                         <CheckBox IsChecked="{Binding Profile.UseOpenAiThreadView}"
                                   Content="{Binding Source={x:Static app:App.Localization}, Path=[Dialog.ApiEditor.UseOpenAiThreadView.Checkbox]}" />
 
-                        <TextBlock Visibility="Collapsed"
-                                   Text="{Binding Source={x:Static app:App.Localization}, Path=[Dialog.ApiEditor.DisableResponseStorage]}" />
-                        <CheckBox Visibility="Collapsed"
-                                  IsChecked="{Binding Profile.DisableResponseStorage}"
-                                  Content="{Binding Source={x:Static app:App.Localization}, Path=[Dialog.ApiEditor.DisableResponseStorage.Checkbox]}" />
-
                         <TextBlock Text="{Binding Source={x:Static app:App.Localization}, Path=[Dialog.ApiEditor.TokenLimit]}" />
                         <TextBox Text="{Binding Profile.ModelAutoCompactTokenLimit, UpdateSourceTrigger=PropertyChanged}" />
 

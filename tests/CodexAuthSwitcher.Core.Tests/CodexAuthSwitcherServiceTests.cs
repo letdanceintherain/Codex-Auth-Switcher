@@ -10,148 +10,123 @@ public sealed class CodexAuthSwitcherServiceTests : IDisposable
     private string CodexHome => Path.Combine(_testRoot, ".codex");
 
     [Fact]
-    public void SwitchProfile_ChangesOnlyConfigAndAuth_NotThreadFiles()
+    public void SwitchProfile_RoundTripPreservesThreadLibraryAndUnrelatedConfig()
     {
-        Directory.CreateDirectory(CodexHome);
-        File.WriteAllText(Path.Combine(CodexHome, "config.toml"), """
-                                                             model = "gpt-5.4"
-                                                             model_reasoning_effort = "xhigh"
+        WriteLiveFiles(
+            """
+            model_provider = "openai"
+            model = "gpt-5.4"
+            model_reasoning_effort = "xhigh"
+            model_auto_compact_token_limit = 256000
 
-                                                             [windows]
-                                                             sandbox = "elevated"
-                                                             """);
-        File.WriteAllText(Path.Combine(CodexHome, "auth.json"), """
-                                                           {
-                                                             "auth_mode": "chatgpt",
-                                                             "OPENAI_API_KEY": null,
-                                                             "tokens": {
-                                                               "refresh_token": "rt_test"
-                                                             }
-                                                           }
-                                                           """);
+            [windows]
+            sandbox = "elevated"
 
-        Directory.CreateDirectory(Path.Combine(CodexHome, "sessions"));
-        File.WriteAllText(Path.Combine(CodexHome, "sessions", "thread.jsonl"), "thread-data");
-        File.WriteAllText(Path.Combine(CodexHome, "state_5.sqlite"), "sqlite-data");
+            [mcp_servers.original]
+            url = "https://example.test/mcp"
+            """,
+            ChatGptAuth("acct-original", "rt-original"));
+        var protectedFiles = CreateThreadLibraryFixture();
 
-        var runtimeEnvironment = new FakeRuntimeEnvironmentService();
-        var service = CreateService(runtimeEnvironment);
+        var service = CreateService();
         service.CaptureCurrentChatGptSnapshot("chatgpt");
-        service.SaveApiProfile(new ApiProfileSpec
-        {
-            Name = "funai",
-            Provider = "crs",
-            BaseUrl = "https://api.funai.vip",
-            Model = "gpt-5.4",
-            ReasoningEffort = "xhigh",
-            WireApi = "responses",
-            RequiresOpenAiAuth = true,
-            DisableResponseStorage = false,
-            ModelAutoCompactTokenLimit = 256000,
-            ApiKey = "sk-test-1234567890"
-        });
 
-        var sessionBefore = File.ReadAllText(Path.Combine(CodexHome, "sessions", "thread.jsonl"));
-        var sqliteBefore = File.ReadAllText(Path.Combine(CodexHome, "state_5.sqlite"));
+        var chatGptProfilePath = Path.Combine(CodexHome, "auth-switcher", "profiles", "chatgpt");
+        Assert.True(File.Exists(Path.Combine(chatGptProfilePath, "auth.bin")));
+        Assert.False(File.Exists(Path.Combine(chatGptProfilePath, "auth.json")));
+
+        File.AppendAllText(Path.Combine(CodexHome, "config.toml"), """
+
+            [mcp_servers.added_after_capture]
+            url = "https://after.example/mcp"
+
+            [plugins.sample]
+            enabled = true
+            """);
+        service.SaveApiProfile(CreateApiProfile());
 
         var switchResult = service.SwitchProfile("funai");
 
         Assert.True(switchResult.RestartRequired);
-        var switchedConfig = File.ReadAllText(Path.Combine(CodexHome, "config.toml"));
-        Assert.Contains("model_provider = \"openai\"", switchedConfig);
-        Assert.DoesNotContain("[model_providers.openai]", switchedConfig);
-        Assert.Contains("disable_response_storage = false", switchedConfig);
-        Assert.Equal("https://api.funai.vip", runtimeEnvironment.OpenAiBaseUrl);
-        using (var document = JsonDocument.Parse(File.ReadAllText(Path.Combine(CodexHome, "auth.json"))))
-        {
-            Assert.Equal("sk-test-1234567890", document.RootElement.GetProperty("OPENAI_API_KEY").GetString());
-        }
-
-        Assert.Equal(sessionBefore, File.ReadAllText(Path.Combine(CodexHome, "sessions", "thread.jsonl")));
-        Assert.Equal(sqliteBefore, File.ReadAllText(Path.Combine(CodexHome, "state_5.sqlite")));
+        var apiConfig = File.ReadAllText(Path.Combine(CodexHome, "config.toml"));
+        Assert.Contains("model_provider = \"openai\"", apiConfig);
+        Assert.Contains("openai_base_url = \"https://api.funai.vip\"", apiConfig);
+        Assert.DoesNotContain("preferred_auth_method", apiConfig);
+        Assert.DoesNotContain("disable_response_storage", apiConfig);
+        Assert.Contains("[mcp_servers.original]", apiConfig);
+        Assert.Contains("[mcp_servers.added_after_capture]", apiConfig);
+        Assert.Contains("[plugins.sample]", apiConfig);
+        AssertApiKey("sk-test-1234567890");
+        AssertFilesUnchanged(protectedFiles);
 
         service.SwitchProfile("chatgpt");
-        var environment = service.GetEnvironment();
-        Assert.Equal("chatgpt", environment.CurrentAuthMode);
-        Assert.Equal("gpt-5.4", environment.Model);
+
+        var chatGptConfig = File.ReadAllText(Path.Combine(CodexHome, "config.toml"));
+        Assert.Contains("model_provider = \"openai\"", chatGptConfig);
+        Assert.Contains("model = \"gpt-5.4\"", chatGptConfig);
+        Assert.DoesNotContain("openai_base_url", chatGptConfig);
+        Assert.Contains("[mcp_servers.original]", chatGptConfig);
+        Assert.Contains("[mcp_servers.added_after_capture]", chatGptConfig);
+        Assert.Contains("[plugins.sample]", chatGptConfig);
+        Assert.Equal("chatgpt", service.GetEnvironment().CurrentAuthMode);
+        AssertFilesUnchanged(protectedFiles);
     }
 
     [Fact]
     public void EnsureCurrentIdentityTracked_AutoCapturesNewChatGptAccountOnlyOnce()
     {
-        Directory.CreateDirectory(CodexHome);
-        File.WriteAllText(Path.Combine(CodexHome, "config.toml"), "model = \"gpt-5.4\"" + Environment.NewLine);
-        File.WriteAllText(Path.Combine(CodexHome, "auth.json"), $$"""
-                                                           {
-                                                             "auth_mode": "chatgpt",
-                                                             "OPENAI_API_KEY": null,
-                                                             "tokens": {
-                                                               "account_id": "acct-auto-001",
-                                                               "id_token": "{{BuildJwt(new { email = "auto@example.com" })}}",
-                                                               "refresh_token": "rt-auto"
-                                                             }
-                                                           }
-                                                           """);
-
+        WriteLiveFiles("model = \"gpt-5.4\"" + Environment.NewLine, $$"""
+            {
+              "auth_mode": "chatgpt",
+              "OPENAI_API_KEY": null,
+              "tokens": {
+                "account_id": "acct-auto-001",
+                "id_token": "{{BuildJwt(new { email = "auto@example.com" })}}",
+                "refresh_token": "rt-auto"
+              }
+            }
+            """);
         var service = CreateService();
 
         var firstSync = service.EnsureCurrentIdentityTracked();
-        var profilesAfterFirstSync = service.GetProfiles();
         var secondSync = service.EnsureCurrentIdentityTracked();
-        var profilesAfterSecondSync = service.GetProfiles();
-        var environment = service.GetEnvironment();
+        var profiles = service.GetProfiles();
 
         Assert.True(firstSync.CreatedProfile);
-        Assert.True(firstSync.IsManaged);
-        Assert.Equal("chatgpt-auto@example.com", firstSync.MatchedProfileName);
         Assert.False(secondSync.CreatedProfile);
-        Assert.True(secondSync.IsManaged);
-        Assert.Single(profilesAfterFirstSync);
-        Assert.Single(profilesAfterSecondSync);
-
-        var profile = profilesAfterSecondSync[0];
+        var profile = Assert.Single(profiles);
         Assert.Equal("auto@example.com", profile.Email);
         Assert.Equal("acct-auto-001", profile.AccountId);
         Assert.True(profile.IsAutoCaptured);
-
-        Assert.NotNull(environment.CurrentProfile);
-        Assert.Equal(profile.Name, environment.CurrentProfile!.ProfileName);
-        Assert.Equal(profile.IdentityFingerprint, environment.CurrentProfile.IdentityFingerprint);
+        var profilePath = Path.Combine(CodexHome, "auth-switcher", "profiles", profile.Name);
+        Assert.True(File.Exists(Path.Combine(profilePath, "auth.bin")));
+        Assert.False(File.Exists(Path.Combine(profilePath, "auth.json")));
     }
 
     [Fact]
-    public void EnsureCurrentIdentityTracked_RecognizesApiProfileUsingOpenAiThreadView()
+    public void EnsureCurrentIdentityTracked_RefreshesSavedChatGptAuthForMatchedAccount()
     {
-        Directory.CreateDirectory(CodexHome);
-        File.WriteAllText(Path.Combine(CodexHome, "config.toml"), """
-                                                             model = "gpt-5.4"
-                                                             model_reasoning_effort = "xhigh"
-                                                             """);
-        File.WriteAllText(Path.Combine(CodexHome, "auth.json"), """
-                                                           {
-                                                             "auth_mode": "chatgpt",
-                                                             "tokens": {
-                                                               "refresh_token": "rt_test"
-                                                             }
-                                                           }
-                                                           """);
+        WriteLiveFiles("model = \"gpt-5.4\"" + Environment.NewLine, ChatGptAuth("acct-refresh", "rt-old"));
+        var service = CreateService();
+        var firstSync = service.EnsureCurrentIdentityTracked();
+        Assert.NotNull(firstSync.MatchedProfileName);
 
-        var runtimeEnvironment = new FakeRuntimeEnvironmentService();
-        var service = CreateService(runtimeEnvironment);
-        service.SaveApiProfile(new ApiProfileSpec
-        {
-            Name = "funai",
-            Provider = "crs",
-            BaseUrl = "https://api.funai.vip",
-            Model = "gpt-5.4",
-            ReasoningEffort = "xhigh",
-            WireApi = "responses",
-            RequiresOpenAiAuth = true,
-            DisableResponseStorage = false,
-            ModelAutoCompactTokenLimit = 256000,
-            ApiKey = "sk-test-1234567890",
-            UseOpenAiThreadView = true
-        });
+        File.WriteAllText(Path.Combine(CodexHome, "auth.json"), ChatGptAuth("acct-refresh", "rt-new"));
+        service.EnsureCurrentIdentityTracked();
+        service.SaveApiProfile(CreateApiProfile());
+        service.SwitchProfile("funai");
+        service.SwitchProfile(firstSync.MatchedProfileName!);
+
+        using var document = JsonDocument.Parse(File.ReadAllText(Path.Combine(CodexHome, "auth.json")));
+        Assert.Equal("rt-new", document.RootElement.GetProperty("tokens").GetProperty("refresh_token").GetString());
+    }
+
+    [Fact]
+    public void EnsureCurrentIdentityTracked_RecognizesApiProfileUsingConfiguredOpenAiBaseUrl()
+    {
+        WriteLiveFiles("model = \"gpt-5.4\"" + Environment.NewLine, ChatGptAuth("acct-api", "rt-api"));
+        var service = CreateService();
+        service.SaveApiProfile(CreateApiProfile());
 
         service.SwitchProfile("funai");
         var sync = service.EnsureCurrentIdentityTracked();
@@ -159,65 +134,181 @@ public sealed class CodexAuthSwitcherServiceTests : IDisposable
 
         Assert.True(sync.IsManaged);
         Assert.Equal("funai", sync.MatchedProfileName);
-        Assert.Equal("https://api.funai.vip", runtimeEnvironment.OpenAiBaseUrl);
         Assert.NotNull(environment.CurrentProfile);
         Assert.Equal("funai", environment.CurrentProfile!.ProfileName);
         Assert.Equal("openai", environment.ModelProvider);
+        Assert.Equal("api.funai.vip", environment.LiveIdentity?.ApiHost);
     }
 
     [Fact]
-    public void SwitchProfile_ForcesLocalResponseStorageOn_ForLegacyApiProfiles()
+    public void SwitchProfile_LegacyChatGptSnapshotMigratesWithoutReplacingWholeConfig()
+    {
+        WriteLiveFiles("""
+            model_provider = "openai"
+            model = "gpt-current"
+
+            [mcp_servers.current]
+            url = "https://current.example/mcp"
+            """, ChatGptAuth("acct-legacy", "rt-live"));
+        var service = CreateService();
+        service.CaptureCurrentChatGptSnapshot("legacy");
+
+        var profilePath = Path.Combine(CodexHome, "auth-switcher", "profiles", "legacy");
+        var protectedStore = new ProtectedSecretStore();
+        var authText = protectedStore.LoadSecret(Path.Combine(profilePath, "auth.bin"));
+        File.Delete(Path.Combine(profilePath, "auth.bin"));
+        File.WriteAllText(Path.Combine(profilePath, "auth.json"), authText);
+        File.WriteAllText(Path.Combine(profilePath, "config.toml"), """
+            model_provider = "openai"
+            model = "gpt-snapshot"
+
+            [mcp_servers.old_snapshot]
+            url = "https://old.example/mcp"
+            """);
+
+        service.SwitchProfile("legacy");
+
+        var configText = File.ReadAllText(Path.Combine(CodexHome, "config.toml"));
+        Assert.Contains("model = \"gpt-snapshot\"", configText);
+        Assert.Contains("[mcp_servers.current]", configText);
+        Assert.DoesNotContain("[mcp_servers.old_snapshot]", configText);
+        Assert.True(File.Exists(Path.Combine(profilePath, "auth.bin")));
+        Assert.False(File.Exists(Path.Combine(profilePath, "auth.json")));
+    }
+
+    [Theory]
+    [InlineData("keyring")]
+    [InlineData("auto")]
+    [InlineData("ephemeral")]
+    public void SwitchProfile_BlocksNonFileCredentialStores(string credentialStore)
+    {
+        WriteLiveFiles($$"""
+            cli_auth_credentials_store = "{{credentialStore}}"
+            model = "gpt-5.4"
+            """, ChatGptAuth("acct-store", "rt-store"));
+        var service = CreateService();
+        service.SaveApiProfile(CreateApiProfile());
+
+        var error = Assert.Throws<InvalidOperationException>(() => service.SwitchProfile("funai"));
+
+        Assert.Contains("cli_auth_credentials_store", error.Message);
+        Assert.Contains("auth.json", error.Message);
+    }
+
+    [Fact]
+    public void SwitchProfile_CanCreateMissingAuthFileInFileMode()
     {
         Directory.CreateDirectory(CodexHome);
-        File.WriteAllText(Path.Combine(CodexHome, "config.toml"), """
-                                                             model = "gpt-5.4"
-                                                             model_reasoning_effort = "xhigh"
-                                                             disable_response_storage = true
-                                                             """);
-        File.WriteAllText(Path.Combine(CodexHome, "auth.json"), """
-                                                           {
-                                                             "auth_mode": "chatgpt",
-                                                             "tokens": {
-                                                               "refresh_token": "rt_test"
-                                                             }
-                                                           }
-                                                           """);
-
+        File.WriteAllText(Path.Combine(CodexHome, "config.toml"), "model = \"gpt-5.4\"" + Environment.NewLine);
         var service = CreateService();
-        service.SaveApiProfile(new ApiProfileSpec
+        service.SaveApiProfile(CreateApiProfile());
+
+        service.SwitchProfile("funai");
+
+        Assert.True(File.Exists(Path.Combine(CodexHome, "auth.json")));
+        AssertApiKey("sk-test-1234567890");
+    }
+
+    [Fact]
+    public void SwitchProfile_RollsBackConfigWhenAuthCannotBeReplaced()
+    {
+        WriteLiveFiles("model = \"gpt-original\"" + Environment.NewLine, ChatGptAuth("acct-lock", "rt-lock"));
+        var originalConfig = File.ReadAllText(Path.Combine(CodexHome, "config.toml"));
+        var originalAuth = File.ReadAllText(Path.Combine(CodexHome, "auth.json"));
+        var service = CreateService();
+        service.SaveApiProfile(CreateApiProfile());
+
+        using var authLock = new FileStream(
+            Path.Combine(CodexHome, "auth.json"),
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read);
+        Assert.Throws<IOException>(() => service.SwitchProfile("funai"));
+
+        Assert.Equal(originalConfig, File.ReadAllText(Path.Combine(CodexHome, "config.toml")));
+        Assert.Equal(originalAuth, File.ReadAllText(Path.Combine(CodexHome, "auth.json")));
+    }
+
+    private CodexAuthSwitcherService CreateService()
+    {
+        var runtimeEnvironment = new FakeRuntimeEnvironmentService();
+        var inspector = new LiveAuthInspector(runtimeEnvironment);
+        var profileStore = new ProfileStore(CodexHome, new ProtectedSecretStore(), inspector);
+        return new CodexAuthSwitcherService(profileStore, inspector, runtimeEnvironment);
+    }
+
+    private static ApiProfileSpec CreateApiProfile()
+    {
+        return new ApiProfileSpec
         {
-            Name = "legacy-api",
+            Name = "funai",
             Provider = "crs",
-            BaseUrl = "https://api.funai.vip",
+            BaseUrl = "https://api.funai.vip/",
             Model = "gpt-5.4",
             ReasoningEffort = "xhigh",
             WireApi = "responses",
             RequiresOpenAiAuth = true,
-            DisableResponseStorage = true,
             ModelAutoCompactTokenLimit = 256000,
-            ApiKey = "sk-test-legacy"
-        });
-
-        var profilePath = Path.Combine(CodexHome, "auth-switcher", "profiles", "legacy-api", "profile.json");
-        var legacyMetadata = File.ReadAllText(profilePath).Replace("\"disableResponseStorage\": false", "\"disableResponseStorage\": true", StringComparison.Ordinal);
-        File.WriteAllText(profilePath, legacyMetadata);
-
-        service.SwitchProfile("legacy-api");
-
-        var configText = File.ReadAllText(Path.Combine(CodexHome, "config.toml"));
-        Assert.Contains("disable_response_storage = false", configText);
-
-        var loaded = service.LoadApiProfile("legacy-api");
-        Assert.NotNull(loaded);
-        Assert.False(loaded!.DisableResponseStorage);
+            ApiKey = "sk-test-1234567890",
+            UseOpenAiThreadView = true
+        };
     }
 
-    private CodexAuthSwitcherService CreateService(FakeRuntimeEnvironmentService? runtimeEnvironment = null)
+    private void WriteLiveFiles(string configText, string authText)
     {
-        runtimeEnvironment ??= new FakeRuntimeEnvironmentService();
-        var inspector = new LiveAuthInspector(runtimeEnvironment);
-        var profileStore = new ProfileStore(CodexHome, new ProtectedSecretStore(), inspector);
-        return new CodexAuthSwitcherService(profileStore, inspector, runtimeEnvironment);
+        Directory.CreateDirectory(CodexHome);
+        File.WriteAllText(Path.Combine(CodexHome, "config.toml"), configText);
+        File.WriteAllText(Path.Combine(CodexHome, "auth.json"), authText);
+    }
+
+    private Dictionary<string, byte[]> CreateThreadLibraryFixture()
+    {
+        var files = new Dictionary<string, byte[]>
+        {
+            ["sessions/thread.jsonl"] = "thread-data"u8.ToArray(),
+            ["archived_sessions/archived.jsonl"] = "archived-data"u8.ToArray(),
+            ["session_index.jsonl"] = "index-data"u8.ToArray(),
+            ["state_5.sqlite"] = [0, 1, 2, 3, 4],
+            ["thread_history_1.sqlite"] = [5, 6, 7, 8]
+        };
+
+        foreach (var (relativePath, content) in files)
+        {
+            var path = Path.Combine(CodexHome, relativePath.Replace('/', Path.DirectorySeparatorChar));
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            File.WriteAllBytes(path, content);
+        }
+
+        return files;
+    }
+
+    private void AssertFilesUnchanged(IReadOnlyDictionary<string, byte[]> expectedFiles)
+    {
+        foreach (var (relativePath, expectedContent) in expectedFiles)
+        {
+            var path = Path.Combine(CodexHome, relativePath.Replace('/', Path.DirectorySeparatorChar));
+            Assert.Equal(expectedContent, File.ReadAllBytes(path));
+        }
+    }
+
+    private void AssertApiKey(string expected)
+    {
+        using var document = JsonDocument.Parse(File.ReadAllText(Path.Combine(CodexHome, "auth.json")));
+        Assert.Equal(expected, document.RootElement.GetProperty("OPENAI_API_KEY").GetString());
+    }
+
+    private static string ChatGptAuth(string accountId, string refreshToken)
+    {
+        return JsonSerializer.Serialize(new
+        {
+            auth_mode = "chatgpt",
+            OPENAI_API_KEY = (string?)null,
+            tokens = new
+            {
+                account_id = accountId,
+                refresh_token = refreshToken
+            }
+        });
     }
 
     private static string BuildJwt(object payload)
@@ -245,15 +336,10 @@ public sealed class CodexAuthSwitcherServiceTests : IDisposable
 
     private sealed class FakeRuntimeEnvironmentService : ICodexRuntimeEnvironmentService
     {
-        public string? OpenAiBaseUrl { get; set; }
-
-        public string? GetOpenAiBaseUrl() => OpenAiBaseUrl;
+        public string? GetOpenAiBaseUrl() => null;
 
         public void ApplyForProfile(ApiProfileSpec? spec)
         {
-            OpenAiBaseUrl = spec is { UseOpenAiThreadView: true }
-                ? spec.BaseUrl.TrimEnd('/')
-                : null;
         }
     }
 }

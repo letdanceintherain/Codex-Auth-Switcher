@@ -9,8 +9,6 @@ public sealed class ApiProfileSpec
     public string ReasoningEffort { get; set; } = "xhigh";
     public string WireApi { get; set; } = "responses";
     public bool RequiresOpenAiAuth { get; set; } = true;
-    // Keep local thread storage enabled so API and local auth share the same thread library.
-    public bool DisableResponseStorage { get; set; } = false;
     public int ModelAutoCompactTokenLimit { get; set; } = 256000;
     public string ApiKey { get; set; } = string.Empty;
     public bool UseOpenAiThreadView { get; set; } = true;

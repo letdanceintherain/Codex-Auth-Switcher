@@ -113,7 +113,8 @@ public sealed class LiveAuthInspector
         var model = TomlOverlayService.TryReadScalar(configText, "model") ?? "(default)";
         var baseUrl = TomlOverlayService.TryReadSectionScalar(configText, $"model_providers.{provider}", "base_url")
             ?? (string.Equals(provider, "openai", StringComparison.OrdinalIgnoreCase)
-                ? _runtimeEnvironment.GetOpenAiBaseUrl()
+                ? TomlOverlayService.TryReadScalar(configText, "openai_base_url")
+                    ?? _runtimeEnvironment.GetOpenAiBaseUrl()
                 : null)
             ?? string.Empty;
         var normalizedBaseUrl = NormalizeBaseUrl(baseUrl);

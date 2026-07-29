@@ -9,6 +9,7 @@ public sealed class ProfileStore
     private const string MetadataFileName = "profile.json";
     private const string ConfigSnapshotFileName = "config.toml";
     private const string AuthSnapshotFileName = "auth.json";
+    private const string ProtectedAuthSnapshotFileName = "auth.bin";
     private const string SecretFileName = "secret.bin";
     private const string CurrentProfileFileName = "current-profile.json";
 
@@ -130,9 +131,6 @@ public sealed class ProfileStore
             ReasoningEffort = metadata.ReasoningEffort ?? "xhigh",
             WireApi = metadata.WireApi ?? "responses",
             RequiresOpenAiAuth = metadata.RequiresOpenAiAuth ?? true,
-            // Older builds exposed this toggle, but the switcher should always preserve
-            // local thread storage so auth modes stay on the same thread library.
-            DisableResponseStorage = false,
             ModelAutoCompactTokenLimit = metadata.ModelAutoCompactTokenLimit ?? 256000,
             ApiKey = apiKey,
             UseOpenAiThreadView = metadata.UseOpenAiThreadView ?? useOpenAiThreadView
@@ -159,8 +157,15 @@ public sealed class ProfileStore
             UpdatedAt = DateTimeOffset.UtcNow
         };
 
-        TextFileService.WriteUtf8NoBom(Path.Combine(profilePath, ConfigSnapshotFileName), configText);
-        TextFileService.WriteUtf8NoBom(Path.Combine(profilePath, AuthSnapshotFileName), authText);
+        TextFileService.WriteUtf8NoBom(
+            Path.Combine(profilePath, ConfigSnapshotFileName),
+            TomlOverlayService.ExtractManagedOverlay(configText));
+        _secretStore.SaveSecret(Path.Combine(profilePath, ProtectedAuthSnapshotFileName), authText);
+        var legacyAuthPath = Path.Combine(profilePath, AuthSnapshotFileName);
+        if (File.Exists(legacyAuthPath))
+        {
+            File.Delete(legacyAuthPath);
+        }
         WriteMetadata(profilePath, metadata);
     }
 
@@ -184,7 +189,6 @@ public sealed class ProfileStore
             ReasoningEffort = spec.ReasoningEffort,
             WireApi = spec.WireApi,
             RequiresOpenAiAuth = spec.RequiresOpenAiAuth,
-            DisableResponseStorage = false,
             ModelAutoCompactTokenLimit = spec.ModelAutoCompactTokenLimit,
             UseOpenAiThreadView = spec.UseOpenAiThreadView,
             IdentityFingerprint = identity.IdentityFingerprint,
@@ -213,12 +217,14 @@ public sealed class ProfileStore
         if (kind == ProfileKind.ChatGptSnapshot)
         {
             var configPath = Path.Combine(profilePath, ConfigSnapshotFileName);
-            var authPath = Path.Combine(profilePath, AuthSnapshotFileName);
-            return (File.ReadAllText(configPath), File.ReadAllText(authPath), kind);
+            var snapshotConfigText = File.Exists(configPath) ? File.ReadAllText(configPath) : string.Empty;
+            var authText = ReadChatGptAuth(profilePath)
+                ?? throw new InvalidOperationException($"ChatGPT profile '{profileName}' does not contain a usable auth snapshot.");
+            var chatGptConfigText = TomlOverlayService.ApplyChatGptOverlay(currentConfigText, snapshotConfigText);
+            return (chatGptConfigText, authText, kind);
         }
 
         var spec = LoadApiProfile(profileName) ?? throw new InvalidOperationException($"API profile '{profileName}' is invalid.");
-        spec.DisableResponseStorage = false;
         var configText = TomlOverlayService.ApplyApiOverlay(currentConfigText, spec);
         var authJson = JsonSerializer.Serialize(new Dictionary<string, string>
         {
@@ -303,10 +309,20 @@ public sealed class ProfileStore
     public string BackupLiveFiles(string configPath, string authPath)
     {
         EnsureLayout();
-        var backupPath = Path.Combine(BackupsPath, DateTime.Now.ToString("yyyyMMdd_HHmmss"));
+        var backupName = DateTime.Now.ToString("yyyyMMdd_HHmmss_fff");
+        var backupPath = Path.Combine(BackupsPath, backupName);
+        for (var suffix = 2; Directory.Exists(backupPath); suffix++)
+        {
+            backupPath = Path.Combine(BackupsPath, $"{backupName}_{suffix}");
+        }
+
         PathHelpers.EnsureDirectory(backupPath);
         File.Copy(configPath, Path.Combine(backupPath, ConfigSnapshotFileName), overwrite: true);
-        File.Copy(authPath, Path.Combine(backupPath, AuthSnapshotFileName), overwrite: true);
+        if (File.Exists(authPath))
+        {
+            File.Copy(authPath, Path.Combine(backupPath, AuthSnapshotFileName), overwrite: true);
+        }
+
         return backupPath;
     }
 
@@ -358,12 +374,16 @@ public sealed class ProfileStore
 
             apiHost ??= TryGetHost(metadata.BaseUrl);
         }
-        else if (File.Exists(legacyAuthPath))
+        else
         {
-            var legacyIdentity = _liveAuthInspector.InspectChatGptSnapshot(File.ReadAllText(legacyAuthPath));
-            email ??= legacyIdentity?.Email;
-            accountId ??= legacyIdentity?.AccountId;
-            identityFingerprint ??= legacyIdentity?.IdentityFingerprint;
+            var authText = ReadChatGptAuth(profilePath);
+            if (!string.IsNullOrWhiteSpace(authText))
+            {
+                var legacyIdentity = _liveAuthInspector.InspectChatGptSnapshot(authText);
+                email ??= legacyIdentity?.Email;
+                accountId ??= legacyIdentity?.AccountId;
+                identityFingerprint ??= legacyIdentity?.IdentityFingerprint;
+            }
         }
 
         return new ProfileSummary
@@ -427,6 +447,47 @@ public sealed class ProfileStore
         }
 
         return null;
+    }
+
+    private string? ReadChatGptAuth(string profilePath)
+    {
+        var protectedPath = Path.Combine(profilePath, ProtectedAuthSnapshotFileName);
+        if (File.Exists(protectedPath))
+        {
+            try
+            {
+                return _secretStore.LoadSecret(protectedPath);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        var legacyPath = Path.Combine(profilePath, AuthSnapshotFileName);
+        if (!File.Exists(legacyPath))
+        {
+            return null;
+        }
+
+        try
+        {
+            var authText = File.ReadAllText(legacyPath);
+            _secretStore.SaveSecret(protectedPath, authText);
+            try
+            {
+                File.Delete(legacyPath);
+            }
+            catch
+            {
+            }
+
+            return authText;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private StoredProfileMetadata? LoadMetadata(string profilePath)

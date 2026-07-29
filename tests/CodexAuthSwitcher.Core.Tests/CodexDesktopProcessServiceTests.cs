@@ -7,7 +7,9 @@ public sealed class CodexDesktopProcessServiceTests
 {
     [Theory]
     [InlineData(@"C:\Program Files\WindowsApps\OpenAI.Codex_26.325.2171.0_x64__2p2nqsd0c76g0\app\Codex.exe", true)]
+    [InlineData(@"C:\Program Files\WindowsApps\OpenAI.Codex_26.721.4979.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe", true)]
     [InlineData(@"C:\Program Files\WindowsApps\OpenAI.Codex_26.325.2171.0_x64__2p2nqsd0c76g0\app\resources\codex.exe", false)]
+    [InlineData(@"C:\Program Files\WindowsApps\OpenAI.ChatGPT_1.0.0.0_x64__foo\app\ChatGPT.exe", false)]
     [InlineData(@"C:\Users\me\.vscode\extensions\openai.chatgpt\bin\windows-x86_64\codex.exe", false)]
     public void IsDesktopCodexPath_ClassifiesExpectedTargets(string path, bool expected)
     {
@@ -15,7 +17,7 @@ public sealed class CodexDesktopProcessServiceTests
     }
 
     [Fact]
-    public void BuildLaunchCandidates_UsesWindowsAppsPathFirst_ThenLastKnown_ThenAppId()
+    public void BuildLaunchCandidates_UsesAppIdFirst_ThenExecutableFallbacks()
     {
         var service = new CodexDesktopProcessService();
         var candidates = service.BuildLaunchCandidates(
@@ -25,6 +27,11 @@ public sealed class CodexDesktopProcessServiceTests
         Assert.Collection(candidates,
             item =>
             {
+                Assert.Equal(RestartMethod.AppId, item.Method);
+                Assert.Equal("OpenAI.Codex_2p2nqsd0c76g0!App", item.Target);
+            },
+            item =>
+            {
                 Assert.Equal(RestartMethod.WindowsAppsPath, item.Method);
                 Assert.Equal(@"C:\Program Files\WindowsApps\OpenAI.Codex_foo\app\Codex.exe", item.Target);
             },
@@ -32,11 +39,6 @@ public sealed class CodexDesktopProcessServiceTests
             {
                 Assert.Equal(RestartMethod.LastKnownDesktopPath, item.Method);
                 Assert.Equal(@"D:\Saved\Codex.exe", item.Target);
-            },
-            item =>
-            {
-                Assert.Equal(RestartMethod.AppId, item.Method);
-                Assert.Equal("OpenAI.Codex_2p2nqsd0c76g0!App", item.Target);
             });
     }
 }

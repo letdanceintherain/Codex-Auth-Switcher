@@ -18,10 +18,10 @@ public sealed class CodexRuntimeEnvironmentService : ICodexRuntimeEnvironmentSer
 
     public void ApplyForProfile(ApiProfileSpec? spec)
     {
-        var baseUrl = spec is { UseOpenAiThreadView: true }
-            ? NormalizeBaseUrl(spec.BaseUrl)
-            : null;
-        SetOpenAiBaseUrl(baseUrl);
+        // Version 1.0 persisted this variable for compatibility mode. Current
+        // Codex reads openai_base_url from config.toml, so remove the legacy
+        // global override to keep all routing state in the managed config.
+        SetOpenAiBaseUrl(null);
     }
 
     private static void SetOpenAiBaseUrl(string? value)

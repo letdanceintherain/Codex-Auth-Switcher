@@ -36,9 +36,9 @@ public sealed class CodexAuthSwitcherService
 
     public CodexEnvironment GetEnvironment()
     {
-        EnsureLiveFilesExist();
+        EnsureConfigExists();
         var configText = File.ReadAllText(ConfigPath);
-        var authText = File.ReadAllText(AuthPath);
+        var authText = File.Exists(AuthPath) ? File.ReadAllText(AuthPath) : "{}";
         var liveIdentity = _liveAuthInspector.Inspect(configText, authText);
         return new CodexEnvironment
         {
@@ -55,7 +55,13 @@ public sealed class CodexAuthSwitcherService
 
     public IdentitySyncResult EnsureCurrentIdentityTracked()
     {
-        EnsureLiveFilesExist();
+        EnsureConfigExists();
+        if (!File.Exists(AuthPath))
+        {
+            _profileStore.DeleteCurrentProfileState();
+            return new IdentitySyncResult();
+        }
+
         var configText = File.ReadAllText(ConfigPath);
         var authText = File.ReadAllText(AuthPath);
         var liveIdentity = _liveAuthInspector.Inspect(configText, authText);
@@ -68,6 +74,17 @@ public sealed class CodexAuthSwitcherService
         var existing = _profileStore.FindProfileByIdentityFingerprint(liveIdentity.IdentityFingerprint);
         if (existing is not null)
         {
+            if (existing.Kind == ProfileKind.ChatGptSnapshot)
+            {
+                _profileStore.SaveChatGptSnapshot(
+                    existing.Name,
+                    configText,
+                    authText,
+                    liveIdentity,
+                    existing.IsAutoCaptured);
+                existing = _profileStore.FindProfileByName(existing.Name) ?? existing;
+            }
+
             _profileStore.WriteCurrentProfileState(existing);
             return new IdentitySyncResult
             {
@@ -124,7 +141,13 @@ public sealed class CodexAuthSwitcherService
 
     public void CaptureCurrentChatGptSnapshot(string profileName)
     {
-        EnsureLiveFilesExist();
+        EnsureConfigExists();
+        EnsureFileCredentialStore(File.ReadAllText(ConfigPath));
+        if (!File.Exists(AuthPath))
+        {
+            throw new FileNotFoundException("Codex auth.json was not found. Sign in with ChatGPT using file credential storage before capturing the account.", AuthPath);
+        }
+
         var configText = File.ReadAllText(ConfigPath);
         var authText = File.ReadAllText(AuthPath);
         var liveIdentity = _liveAuthInspector.Inspect(configText, authText);
@@ -172,22 +195,30 @@ public sealed class CodexAuthSwitcherService
 
     public SwitchResult SwitchProfile(string profileName)
     {
-        EnsureLiveFilesExist();
+        EnsureConfigExists();
         var currentConfigText = File.ReadAllText(ConfigPath);
-        var backupPath = _profileStore.BackupLiveFiles(ConfigPath, AuthPath);
+        EnsureFileCredentialStore(currentConfigText);
         var (configText, authText, kind) = _profileStore.LoadProfileFilesForSwitch(profileName, currentConfigText);
-        TextFileService.WriteUtf8NoBom(ConfigPath, configText);
-        TextFileService.WriteUtf8NoBom(AuthPath, authText);
+        var backupPath = _profileStore.BackupLiveFiles(ConfigPath, AuthPath);
+        TextFileService.WriteConfigAndAuthTransactional(ConfigPath, configText, AuthPath, authText);
         _runtimeEnvironment.ApplyForProfile(kind == ProfileKind.ApiKey ? _profileStore.LoadApiProfile(profileName) : null);
 
-        var summary = _profileStore.FindProfileByName(profileName);
-        if (summary is not null)
+        try
         {
-            _profileStore.WriteCurrentProfileState(summary);
+            var summary = _profileStore.FindProfileByName(profileName);
+            if (summary is not null)
+            {
+                _profileStore.WriteCurrentProfileState(summary);
+            }
+            else
+            {
+                _profileStore.WriteCurrentProfileState(profileName, kind);
+            }
         }
-        else
+        catch
         {
-            _profileStore.WriteCurrentProfileState(profileName, kind);
+            // The live auth switch is authoritative. Refresh will reconstruct
+            // this convenience state from the active identity if needed.
         }
 
         return new SwitchResult
@@ -199,16 +230,23 @@ public sealed class CodexAuthSwitcherService
         };
     }
 
-    private void EnsureLiveFilesExist()
+    private void EnsureConfigExists()
     {
         if (!File.Exists(ConfigPath))
         {
             throw new FileNotFoundException("Codex config.toml was not found.", ConfigPath);
         }
+    }
 
-        if (!File.Exists(AuthPath))
+    private static void EnsureFileCredentialStore(string configText)
+    {
+        var credentialStore = TomlOverlayService.TryReadScalar(configText, "cli_auth_credentials_store") ?? "file";
+        if (!string.Equals(credentialStore, "file", StringComparison.OrdinalIgnoreCase))
         {
-            throw new FileNotFoundException("Codex auth.json was not found.", AuthPath);
+            throw new InvalidOperationException(
+                $"Codex is configured with cli_auth_credentials_store = '{credentialStore}'. " +
+                "Codex Auth Switcher only performs deterministic switches when credentials are stored in auth.json. " +
+                "Set cli_auth_credentials_store = \"file\" and sign in again before switching profiles.");
         }
     }
 

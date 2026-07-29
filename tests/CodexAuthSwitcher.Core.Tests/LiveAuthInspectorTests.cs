@@ -62,16 +62,14 @@ public sealed class LiveAuthInspectorTests
     }
 
     [Fact]
-    public void Inspect_OpenAiCompatibility_UsesRuntimeBaseUrlWhenBuiltInProviderHasNoOverrideSection()
+    public void Inspect_OpenAiCompatibility_UsesConfiguredBaseUrl()
     {
-        var runtimeEnvironment = new FakeRuntimeEnvironmentService
-        {
-            OpenAiBaseUrl = "https://api.funai.vip"
-        };
+        var runtimeEnvironment = new FakeRuntimeEnvironmentService();
         var inspector = new LiveAuthInspector(runtimeEnvironment);
         var configText = """
                          model_provider = "openai"
                          model = "gpt-5.4"
+                         openai_base_url = "https://api.funai.vip"
                          """;
         var authJson = """
                        {
@@ -111,9 +109,7 @@ public sealed class LiveAuthInspectorTests
 
         public void ApplyForProfile(ApiProfileSpec? spec)
         {
-            OpenAiBaseUrl = spec is { UseOpenAiThreadView: true }
-                ? spec.BaseUrl.TrimEnd('/')
-                : null;
+            OpenAiBaseUrl = null;
         }
     }
 }

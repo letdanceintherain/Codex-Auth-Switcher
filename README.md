@@ -32,13 +32,14 @@ If a prebuilt installer is not available on the Releases page yet, build from so
 - `%USERPROFILE%\.codex\archived_sessions`
 - `%USERPROFILE%\.codex\session_index.jsonl`
 - `%USERPROFILE%\.codex\state_5.sqlite`
+- `%USERPROFILE%\.codex\thread_history_1.sqlite`
 
 ## Why this exists
 
 Switching Codex auth manually is easy to get wrong:
 
 - ChatGPT login and API mode can drift into different local states
-- a bad API config can disable local response storage
+- switching the whole config can accidentally roll back unrelated Codex settings
 - hand-editing auth files is tedious and fragile
 - restarting Codex cleanly after a switch is easy to forget
 
@@ -48,12 +49,13 @@ This project turns that into a repeatable GUI workflow with backups and safer de
 
 - Manage ChatGPT snapshots and API profiles in a native Windows UI
 - Auto-detect new ChatGPT accounts after you log in manually
-- Store API keys with Windows DPAPI under the current user account
+- Store API keys and ChatGPT auth snapshots with Windows DPAPI under the current user account
 - Back up the live auth files before each switch
 - Restart Codex automatically after switching
 - Support runtime Chinese and English UI switching
-- Keep local response storage enabled for API profiles
-- Provide a compatibility mode that tries to align API use with the local Codex thread view
+- Preserve the same `CODEX_HOME` and local thread/state databases across all profiles
+- Apply only managed auth and model-routing keys, preserving MCP, plugin, project, and desktop settings
+- Support both the current `ChatGPT.exe` desktop process and legacy `Codex.exe` builds
 
 ## How it works
 
@@ -89,7 +91,7 @@ The app includes a `Use local thread view compatibility` option for API profiles
 When enabled:
 
 - the live config is written with `model_provider = "openai"`
-- the third-party OpenAI-compatible endpoint is injected through `OPENAI_BASE_URL`
+- the third-party OpenAI-compatible endpoint is written to the supported `openai_base_url` config key
 - the switcher avoids writing an invalid `[model_providers.openai]` override
 
 This is the least invasive strategy we found for making API-backed sessions behave as closely as possible to the local Codex thread view, while still using a custom OpenAI-compatible backend.
@@ -108,13 +110,13 @@ This is the least invasive strategy we found for making API-backed sessions beha
 1. Create an API profile in the GUI.
 2. Keep `Use local thread view compatibility` enabled if you want the closest behavior to the local view.
 3. Switch to the API profile.
-4. The app updates live auth files, applies runtime environment settings, and restarts Codex.
+4. The app updates auth and managed provider settings, then performs a verified Codex restart.
 
 ### Scenario C: switch back from API to ChatGPT
 
 1. Select a saved ChatGPT snapshot.
 2. Click `Switch`.
-3. The app restores the snapshot and clears the API runtime override.
+3. The app restores encrypted auth and the snapshot's managed provider settings without replacing the rest of `config.toml`.
 4. Codex restarts into that saved login state.
 
 ## Safety model
@@ -124,9 +126,11 @@ The project does **not** rewrite the Codex thread database to force consistency.
 Instead, it focuses on:
 
 - stable auth switching
-- preserving local response storage
-- controlling runtime provider behavior
+- preserving the same Codex and SQLite homes
+- changing only authentication and model-routing settings
 - minimizing changes to Codex-owned state
+
+The switcher requires Codex CLI credentials to use `cli_auth_credentials_store = "file"` (or the current default when that key is absent). It refuses to switch when keyring, auto, or ephemeral credential storage is active because editing `auth.json` would not be deterministic.
 
 ## Requirements
 
@@ -175,9 +179,11 @@ The project has working release builds and test coverage for the main switching 
 - ChatGPT snapshot capture
 - new-account auto-detection
 - API profile persistence
-- local response storage protection
+- encrypted ChatGPT auth snapshots with v1.0 profile migration
+- transactional config/auth writes with rollback
 - local thread-view compatibility mode
-- runtime `OPENAI_BASE_URL` handling
+- current `openai_base_url` handling
+- current `ChatGPT.exe` process detection and verified restart
 
 ## License
 
@@ -217,13 +223,14 @@ Codex Auth Switcher 是一个面向 Windows 的 Codex 图形化认证切换器�
 - `%USERPROFILE%\.codex\archived_sessions`
 - `%USERPROFILE%\.codex\session_index.jsonl`
 - `%USERPROFILE%\.codex\state_5.sqlite`
+- `%USERPROFILE%\.codex\thread_history_1.sqlite`
 
 ## 这个项目解决什么问题
 
 手动切换 Codex 认证时，常见问题包括：
 
 - ChatGPT 登录和 API 模式逐渐分叉成不同的本地状态
-- 错误的 API 配置可能会关闭本地响应存储
+- 整份切换配置可能意外回滚其他 Codex 设置
 - 手动编辑认证文件容易出错
 - 切换后忘记正确重启 Codex
 
@@ -233,12 +240,13 @@ Codex Auth Switcher 是一个面向 Windows 的 Codex 图形化认证切换器�
 
 - 用原生 Windows 界面管理 ChatGPT 快照和 API profiles
 - 在你手动登录新 ChatGPT 账号后，自动检测并收录新账号
-- API key 使用 Windows 当前用户 DPAPI 加密保存
+- API key 和 ChatGPT 认证快照都使用 Windows 当前用户 DPAPI 加密保存
 - 每次切换前自动备份 live 配置
 - 切换后自动重启 Codex
 - 支持运行时中英文切换
-- API profile 默认保持本地响应存储开启
-- 提供“沿用本地对话框视图”的兼容模式
+- 所有 profile 始终使用同一个 `CODEX_HOME` 和本地线程/状态数据库
+- 只应用认证和模型路由键，保留 MCP、插件、项目和桌面设置
+- 同时兼容当前 `ChatGPT.exe` 桌面进程和旧版 `Codex.exe`
 
 ## 设计使用方法
 
@@ -289,7 +297,7 @@ API profile 里有一个 `Use local thread view compatibility` 选项。
 开启后：
 
 - live 配置会写成 `model_provider = "openai"`
-- 第三方 OpenAI-compatible 地址通过 `OPENAI_BASE_URL` 注入
+- 第三方 OpenAI-compatible 地址写入当前支持的 `openai_base_url` 配置键
 - 不会往 `config.toml` 里写非法的 `[model_providers.openai]`
 
 这是目前最保守、最少侵入的一种方案，目标是在不直接改线程数据库的前提下，让 API 侧尽量贴近本地对话框视图。
@@ -308,13 +316,13 @@ API profile 里有一个 `Use local thread view compatibility` 选项。
 1. 在 GUI 里新建一个 API profile
 2. 如果你希望它尽量沿用本地对话框视图，就保持兼容模式开启
 3. 点击切换
-4. 工具会更新 live 配置、应用运行时环境，并重启 Codex
+4. 工具会更新认证和受管理的 provider 设置，并验证 Codex 确实完成重启
 
 ### 场景 C：从 API 切回 ChatGPT
 
 1. 选择之前保存好的 ChatGPT snapshot
 2. 点击切换
-3. 工具恢复对应快照，并清理 API 运行时覆盖
+3. 工具恢复加密认证和快照中的模型路由键，不会替换其余 `config.toml`
 4. Codex 重启并回到那个账号状态
 
 ## 安全边界
@@ -324,9 +332,11 @@ API profile 里有一个 `Use local thread view compatibility` 选项。
 它的设计重点是：
 
 - 让认证切换过程稳定
-- 保持本地响应存储开启
-- 通过运行时环境控制 provider 行为
+- 始终沿用同一个 Codex 和 SQLite 目录
+- 只修改认证和模型路由设置
 - 尽量少碰 Codex 自己维护的数据
+
+切换器要求 Codex CLI 使用 `cli_auth_credentials_store = "file"`（未配置该键时沿用当前默认值）。如果启用了 keyring、auto 或 ephemeral 凭据存储，程序会阻止切换，因为此时修改 `auth.json` 无法保证生效。
 
 ## 运行要求
 
@@ -375,9 +385,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\publish.ps1 -Clean
 - ChatGPT 快照保存
 - 新账号自动检测
 - API profile 持久化
-- 本地响应存储保护
+- ChatGPT 认证快照加密保存并兼容迁移 v1.0 profile
+- config/auth 事务写入和失败回滚
 - 本地对话框视图兼容模式
-- `OPENAI_BASE_URL` 运行时处理
+- 当前 `openai_base_url` 配置处理
+- 当前 `ChatGPT.exe` 进程识别和验证重启
 
 ## 许可证
 

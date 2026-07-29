@@ -6,6 +6,7 @@ namespace CodexAuthSwitcher.Core.Services;
 public sealed class CodexDesktopProcessService
 {
     private const string AppId = "OpenAI.Codex_2p2nqsd0c76g0!App";
+    private static readonly string[] DesktopProcessNames = ["ChatGPT", "Codex"];
 
     public DesktopAppState GetDesktopAppState()
     {
@@ -13,7 +14,10 @@ public sealed class CodexDesktopProcessService
         return new DesktopAppState
         {
             IsRunning = processes.Count > 0,
-            DesktopAppPath = processes.Select(GetProcessPathSafe).FirstOrDefault(path => !string.IsNullOrWhiteSpace(path)),
+            DesktopAppPath = processes
+                .OrderByDescending(process => GetMainWindowHandleSafe(process) != nint.Zero)
+                .Select(GetProcessPathSafe)
+                .FirstOrDefault(path => !string.IsNullOrWhiteSpace(path)),
             ProcessIds = processes.Select(process => process.Id).ToArray()
         };
     }
@@ -71,9 +75,14 @@ public sealed class CodexDesktopProcessService
 
     public RestartMethod RestartDesktopApp(string? lastKnownDesktopAppPath)
     {
+        if (GetDesktopProcesses().Count > 0)
+        {
+            return RestartMethod.None;
+        }
+
         foreach (var candidate in BuildLaunchCandidates(TryGetWindowsAppsExecutablePath(), lastKnownDesktopAppPath))
         {
-            if (TryLaunchCandidate(candidate))
+            if (TryLaunchCandidate(candidate) && WaitForDesktopApp(TimeSpan.FromSeconds(12)))
             {
                 return candidate.Method;
             }
@@ -100,9 +109,9 @@ public sealed class CodexDesktopProcessService
             candidates.Add((method, target));
         }
 
+        Add(RestartMethod.AppId, AppId);
         Add(RestartMethod.WindowsAppsPath, windowsAppsPath);
         Add(RestartMethod.LastKnownDesktopPath, lastKnownDesktopAppPath);
-        Add(RestartMethod.AppId, AppId);
         return candidates;
     }
 
@@ -113,15 +122,32 @@ public sealed class CodexDesktopProcessService
             return false;
         }
 
-        return path.EndsWith(@"\app\Codex.exe", StringComparison.OrdinalIgnoreCase)
+        var isPackageExecutable = path.EndsWith(@"\app\ChatGPT.exe", StringComparison.OrdinalIgnoreCase)
+                                  || path.EndsWith(@"\app\Codex.exe", StringComparison.OrdinalIgnoreCase);
+        return isPackageExecutable
                && path.Contains(@"\OpenAI.Codex_", StringComparison.OrdinalIgnoreCase);
     }
 
     private static List<Process> GetDesktopProcesses()
     {
-        return Process.GetProcessesByName("Codex")
+        return DesktopProcessNames
+            .SelectMany(Process.GetProcessesByName)
             .Where(process => IsDesktopCodexPath(GetProcessPathSafe(process)))
+            .GroupBy(process => process.Id)
+            .Select(group => group.First())
             .ToList();
+    }
+
+    private static nint GetMainWindowHandleSafe(Process process)
+    {
+        try
+        {
+            return process.MainWindowHandle;
+        }
+        catch
+        {
+            return nint.Zero;
+        }
     }
 
     private static string? GetProcessPathSafe(Process process)
@@ -143,7 +169,7 @@ public sealed class CodexDesktopProcessService
             using var process = Process.Start(new ProcessStartInfo
             {
                 FileName = "powershell.exe",
-                Arguments = "-NoProfile -Command \"$pkg = Get-AppxPackage OpenAI.Codex | Select-Object -First 1 -ExpandProperty InstallLocation; if ($pkg) { Join-Path $pkg 'app\\\\Codex.exe' }\"",
+                Arguments = "-NoProfile -Command \"$pkg = Get-AppxPackage OpenAI.Codex | Select-Object -First 1 -ExpandProperty InstallLocation; if ($pkg) { $current = Join-Path $pkg 'app\\\\ChatGPT.exe'; $legacy = Join-Path $pkg 'app\\\\Codex.exe'; if (Test-Path -LiteralPath $current) { $current } elseif (Test-Path -LiteralPath $legacy) { $legacy } }\"",
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
@@ -192,5 +218,21 @@ public sealed class CodexDesktopProcessService
         {
             return false;
         }
+    }
+
+    private static bool WaitForDesktopApp(TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            if (GetDesktopProcesses().Count > 0)
+            {
+                return true;
+            }
+
+            Thread.Sleep(200);
+        }
+
+        return false;
     }
 }

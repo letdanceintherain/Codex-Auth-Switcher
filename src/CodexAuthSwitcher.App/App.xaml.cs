@@ -1,6 +1,6 @@
-using System.IO;
 using System.Windows;
 using CodexAuthSwitcher.App.Services;
+using CodexAuthSwitcher.Core.Services;
 
 namespace CodexAuthSwitcher.App;
 
@@ -12,7 +12,7 @@ public partial class App : Application
     {
         base.OnStartup(e);
 
-        var codexHome = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex");
+        var codexHome = CodexPathResolver.ResolveCodexHome();
         Localization.Initialize(codexHome);
 
         var window = new MainWindow(codexHome);
