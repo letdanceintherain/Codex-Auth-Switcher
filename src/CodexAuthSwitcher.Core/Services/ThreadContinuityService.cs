@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -14,7 +15,7 @@ internal static class ThreadContinuityService
 {
     private sealed record FileChange(string Path, string Staged, string Backup, bool Existed);
     private sealed record OffsetChange(long Start, long End, long Delta);
-    private sealed record RolloutChange(string Id, List<OffsetChange> Offsets);
+    private sealed record RolloutChange(string Id, long OriginalLength, List<OffsetChange> Offsets, bool IsPaginated);
 
     private sealed class Database : IDisposable
     {
@@ -66,12 +67,17 @@ internal static class ThreadContinuityService
                 .Any(path => !string.Equals(path, statePath, StringComparison.OrdinalIgnoreCase)))
                 throw new IOException("Unsupported Codex state database version. No switch was applied.");
 
+            if (!File.Exists(statePath) && File.Exists(historyPath))
+                throw new IOException("The Codex history cache exists without its state database. Its rollout ownership cannot be verified. No switch was applied.");
+
             var state = OpenDatabase(statePath, backupDirectory, databases);
             var history = OpenDatabase(historyPath, backupDirectory, databases);
-            var rollouts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var archivedIds = new HashSet<string>(StringComparer.Ordinal);
+            // SQLite owns the identity/path association. A fork can retain its
+            // source session_meta ID, and the directory can contain old copies.
+            var rollouts = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
             var archivedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var activeIds = new List<string>();
+            var replacementPaths = new Dictionary<string, string>(StringComparer.Ordinal);
             if (state is not null)
             {
                 using var query = Command(state, "SELECT id, rollout_path, archived FROM threads");
@@ -84,7 +90,6 @@ internal static class ThreadContinuityService
                     // Some older records can disagree after moves/restores.
                     if (reader.GetInt64(2) != 0 || (path is not null && IsArchivedPath(codexHome, path)))
                     {
-                        archivedIds.Add(id);
                         if (path is not null) archivedPaths.Add(path);
                         continue;
                     }
@@ -93,12 +98,15 @@ internal static class ThreadContinuityService
                     EnsureLocalRollout(codexHome, path);
                     if (!path.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase))
                         throw new IOException($"Unsupported rollout format: {path}. No switch was applied.");
-                    rollouts.Add(path);
+                    if (!rollouts.TryAdd(path, id))
+                        throw new IOException($"Multiple indexed threads reference the same rollout: {path}. No switch was applied.");
                 }
             }
 
             var sessionsRoot = System.IO.Path.Combine(codexHome, "sessions");
-            if (Directory.Exists(sessionsRoot))
+            // Only legacy homes without a state DB fall back to enumeration.
+            // Never mix indexed paths with unreferenced files/copies.
+            if (state is null && Directory.Exists(sessionsRoot))
             {
                 foreach (var path in Directory.EnumerateFiles(sessionsRoot, "*", new EnumerationOptions
                 {
@@ -107,27 +115,44 @@ internal static class ThreadContinuityService
                     AttributesToSkip = FileAttributes.ReparsePoint
                 }))
                 {
-                    if (archivedPaths.Contains(path)) continue;
                     if (path.EndsWith(".jsonl.zst", StringComparison.OrdinalIgnoreCase))
                         throw new IOException("Compressed Codex rollouts are not supported by this switcher version. No switch was applied.");
-                    if (path.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase)) rollouts.Add(path);
+                    if (path.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase)) rollouts.Add(path, null);
                 }
             }
 
-            rollouts.ExceptWith(archivedPaths);
-            foreach (var path in rollouts.Order(StringComparer.OrdinalIgnoreCase))
+            if (rollouts.Keys.Any(archivedPaths.Contains))
+                throw new IOException("An active and an archived thread reference the same rollout. No switch was applied.");
+            var legacyRolloutIds = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var (path, canonicalId) in rollouts.OrderBy(item => item.Key, StringComparer.OrdinalIgnoreCase))
             {
                 EnsureLocalRollout(codexHome, path);
                 var staged = path + "." + Guid.NewGuid().ToString("N") + ".switchtmp";
                 try
                 {
-                    var change = StageRollout(path, staged, provider, archivedIds);
+                    var change = StageRollout(path, staged, provider, canonicalId);
                     if (change is null) continue;
+                    // An unchanged duplicate is still ambiguous: never bind a
+                    // changed copy to a cache owned by another physical file.
+                    if (!legacyRolloutIds.Add(change.Id))
+                        throw new IOException($"Duplicate session identity in local rollouts: {change.Id}. No switch was applied.");
+                    if (change.Offsets.Count == 0) continue;
+                    if (change.IsPaginated)
+                    {
+                        // A new immutable rollout generation preserves every old
+                        // cache and history_base reference, including archives.
+                        var logicalId = Guid.Parse(canonicalId!).ToString();
+                        var timestamp = DateTime.Now.ToString("yyyy-MM-ddTHH-mm-ss", CultureInfo.InvariantCulture);
+                        var name = $"rollout-{timestamp}-{logicalId}_{Guid.NewGuid()}.jsonl";
+                        var replacement = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(path)!, name);
+                        if (File.Exists(replacement)) throw new IOException("The replacement rollout already exists.");
+                        files.Add(new FileChange(replacement, staged, path, false));
+                        replacementPaths.Add(canonicalId!, replacement);
+                        continue;
+                    }
                     var fileBackup = System.IO.Path.Combine(backupDirectory, $"rollout-{files.Count}.jsonl");
                     File.Copy(path, fileBackup);
                     files.Add(new FileChange(path, staged, fileBackup, true));
-                    if (rolloutChanges.Any(existing => existing.Id == change.Id))
-                        throw new IOException($"Duplicate session identity in local rollouts: {change.Id}. No switch was applied.");
                     rolloutChanges.Add(change);
                 }
                 finally
@@ -138,33 +163,54 @@ internal static class ThreadContinuityService
 
             if (state is not null)
             {
-                using var update = Command(state, "UPDATE threads SET model_provider = $provider WHERE id = $id AND archived = 0 AND model_provider IS NOT $provider");
+                using var update = Command(state, "UPDATE threads SET model_provider = $provider, rollout_path = COALESCE($path, rollout_path) WHERE id = $id AND archived = 0 AND (model_provider IS NOT $provider OR $path IS NOT NULL)");
                 update.Parameters.AddWithValue("$provider", provider);
                 var idParameter = update.Parameters.Add("$id", SqliteType.Text);
+                var pathParameter = update.Parameters.Add("$path", SqliteType.Text);
                 foreach (var id in activeIds)
                 {
                     idParameter.Value = id;
+                    pathParameter.Value = replacementPaths.TryGetValue(id, out var replacement) ? replacement : DBNull.Value;
                     changedThreads += update.ExecuteNonQuery();
                 }
             }
-            // A changed JSONL line can change byte offsets used by the materialized
-            // history cache. Preserve items/turns and shift only the read cursor.
+            // Legacy byte rewrites move both the projection checkpoint and
+            // persisted turn boundaries. Both belong to the physical rollout,
+            // not necessarily to the logical thread after thread/revert.
             if (history is not null)
             {
+                var turnColumns = ReadTableColumns(history, "thread_turns");
                 foreach (var change in rolloutChanges)
                 {
                     using var query = Command(history, "SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id = $id");
                     query.Parameters.AddWithValue("$id", change.Id);
                     var value = query.ExecuteScalar();
-                    if (value is null) continue;
-                    var offset = Convert.ToInt64(value);
-                    if (change.Offsets.Any(item => item.Start < offset && offset < item.End))
-                        throw new IOException($"Invalid history byte offset for thread {change.Id}. No switch was applied.");
-                    var delta = change.Offsets.Where(item => item.End <= offset).Sum(item => item.Delta);
-                    using var update = Command(history, "UPDATE thread_history_projection_state SET next_rollout_byte_offset = $offset WHERE thread_id = $id");
-                    update.Parameters.AddWithValue("$id", change.Id);
-                    update.Parameters.AddWithValue("$offset", offset + delta);
-                    update.ExecuteNonQuery();
+                    if (value is not null)
+                    {
+                        using var update = Command(history, "UPDATE thread_history_projection_state SET next_rollout_byte_offset = $offset WHERE thread_id = $id");
+                        update.Parameters.AddWithValue("$id", change.Id);
+                        update.Parameters.AddWithValue("$offset", ShiftOffset(change, Convert.ToInt64(value)));
+                        update.ExecuteNonQuery();
+                    }
+                    foreach (var column in new[] { "rollout_byte_offset", "rollout_end_byte_offset" })
+                    {
+                        if (!turnColumns.Contains(column)) continue;
+                        var offsets = new List<(string TurnId, long Offset)>();
+                        using (var turns = Command(history, $"SELECT turn_id, {column} FROM thread_turns WHERE thread_id = $id AND {column} IS NOT NULL"))
+                        {
+                            turns.Parameters.AddWithValue("$id", change.Id);
+                            using var reader = turns.ExecuteReader();
+                            while (reader.Read()) offsets.Add((reader.GetString(0), ShiftOffset(change, reader.GetInt64(1))));
+                        }
+                        foreach (var (turnId, offset) in offsets)
+                        {
+                            using var update = Command(history, $"UPDATE thread_turns SET {column} = $offset WHERE thread_id = $id AND turn_id = $turn");
+                            update.Parameters.AddWithValue("$id", change.Id);
+                            update.Parameters.AddWithValue("$turn", turnId);
+                            update.Parameters.AddWithValue("$offset", offset);
+                            update.ExecuteNonQuery();
+                        }
+                    }
                 }
             }
 
@@ -298,6 +344,43 @@ internal static class ThreadContinuityService
         return command;
     }
 
+    private static HashSet<string> ReadTableColumns(Database database, string table)
+    {
+        using var query = Command(database, $"PRAGMA table_info({table})");
+        using var reader = query.ExecuteReader();
+        var columns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        while (reader.Read()) columns.Add(reader.GetString(1));
+        return columns;
+    }
+
+    private static long ShiftOffset(RolloutChange change, long offset)
+    {
+        if (offset < 0 || offset > change.OriginalLength
+            || change.Offsets.Any(item => item.Start < offset && offset < item.End))
+            throw new IOException($"Invalid history byte offset for thread {change.Id}. No switch was applied.");
+        return checked(offset + change.Offsets.Where(item => item.End <= offset).Sum(item => item.Delta));
+    }
+
+    private static string? ReadPhysicalRolloutId(string path, string? canonicalId)
+    {
+        // Codex's canonical grammar is rollout-{yyyy-MM-ddTHH-mm-ss}-
+        // {thread UUID}[_{immutable rollout UUID}].jsonl. Noncanonical
+        // filenames remain supported only through the legacy identity fallback.
+        var name = System.IO.Path.GetFileName(path);
+        if (!name.StartsWith("rollout-", StringComparison.Ordinal)
+            || !name.EndsWith(".jsonl", StringComparison.Ordinal)) return null;
+        var core = name[8..^6];
+        if (core.Length <= 20 || core[19] != '-'
+            || !DateTime.TryParseExact(core[..19], "yyyy-MM-dd'T'HH-mm-ss", CultureInfo.InvariantCulture,
+                DateTimeStyles.None, out _)) return null;
+        var ids = core[20..].Split('_');
+        if (ids.Length is < 1 or > 2 || !Guid.TryParse(ids[0], out var threadId)
+            || !Guid.TryParse(ids[^1], out var rolloutId)) return null;
+        if (canonicalId is not null && (!Guid.TryParse(canonicalId, out var expected) || expected != threadId))
+            throw new IOException($"The indexed thread identity does not match its rollout filename: {path}. No switch was applied.");
+        return rolloutId.ToString("D");
+    }
+
     private static void StageText(string path, string text, string backups, List<FileChange> files)
     {
         var staged = path + "." + Guid.NewGuid().ToString("N") + ".switchtmp";
@@ -324,12 +407,14 @@ internal static class ThreadContinuityService
         System.IO.Path.GetRelativePath(codexHome, path).StartsWith(
             "archived_sessions" + System.IO.Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
 
-    private static RolloutChange? StageRollout(string path, string staged, string provider, HashSet<string> archivedIds)
+    private static RolloutChange? StageRollout(string path, string staged, string provider, string? canonicalId)
     {
         using var input = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read);
         using var output = File.Create(staged);
         var offsets = new List<OffsetChange>();
         string? id = null;
+        var sawSessionMeta = false;
+        var isPaginated = false;
         long position = 0;
         foreach (var line in ReadLines(input))
         {
@@ -344,9 +429,21 @@ internal static class ThreadContinuityService
             string? field = null;
             if (type == "session_meta")
             {
-                id ??= root.GetProperty("payload").GetProperty("id").GetString();
-                // Do not associate a stray copy with an archived thread's cache.
-                if (id is not null && archivedIds.Contains(id)) return null;
+                if (root.GetProperty("payload").TryGetProperty("history_mode", out var mode)
+                    && mode.GetString() == "paginated")
+                {
+                    if (canonicalId is null)
+                        throw new IOException("Paginated history requires its Codex state database. No switch was applied.");
+                    if (!Guid.TryParseExact(canonicalId, "D", out _))
+                        throw new IOException("Paginated history requires a valid indexed thread UUID.");
+                    isPaginated = true;
+                }
+                id ??= ReadPhysicalRolloutId(path, canonicalId)
+                    ?? canonicalId ?? root.GetProperty("payload").GetProperty("id").GetString();
+                sawSessionMeta = true;
+                // Retain all identities, including embedded source metadata.
+                // Only provider routing changes; cache updates use the physical
+                // rollout ID, with a legacy logical-ID fallback.
                 field = "model_provider";
             }
             else if (type == "event_msg"
@@ -374,9 +471,8 @@ internal static class ThreadContinuityService
             output.Write(updated);
             position += line.Length;
         }
-        if (offsets.Count == 0) return null;
-        if (string.IsNullOrWhiteSpace(id)) throw new IOException($"Missing session identity in {path}");
-        return new RolloutChange(id, offsets);
+        if (!sawSessionMeta || string.IsNullOrWhiteSpace(id)) throw new IOException($"Missing session identity in {path}");
+        return new RolloutChange(id, position, offsets, isPaginated);
     }
 
     // Preserve UTF-8 bytes and CRLF/LF exactly for every untouched JSONL record.

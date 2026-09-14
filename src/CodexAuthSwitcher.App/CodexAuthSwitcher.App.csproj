@@ -16,7 +16,7 @@
     <UseWPF>true</UseWPF>
     <AssemblyName>CodexAuthSwitcher</AssemblyName>
     <RootNamespace>CodexAuthSwitcher.App</RootNamespace>
-    <Version>1.2.1</Version>
+    <Version>1.2.2</Version>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>true</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>

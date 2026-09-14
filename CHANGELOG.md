@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.2 - 2026-09-15
+
+- Select active rollouts from SQLite's logical thread ID / current path mapping; unreferenced old copies no longer cause false duplicate-ID failures.
+- Preserve immutable paginated history using copy-on-write generations: update routing in a new physical rollout, retain the logical thread ID, and keep originals, caches, ordinals, inherited-history references and archived descendants unchanged.
+- Recognize physical rollout UUIDs in reverted-thread filenames instead of treating the first embedded session ID as cache ownership.
+- Update legacy history projection cursors and turn boundary offsets together; reject unsafe missing-index, shared-path and invalid-offset cases with rollback.
+- Add realistic paginated/reverted/forked-history regressions and real Codex fork/read/resume tests, including a loopback-only model-context capture check.
+
 ## 1.2.1 - 2026-09-14
 
 - Skip archived_sessions entirely so duplicate archived session IDs no longer block switching.

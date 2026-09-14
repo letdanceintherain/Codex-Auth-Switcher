@@ -119,16 +119,421 @@ public sealed class ThreadContinuityTests : IDisposable
     }
 
     [Fact]
-    public void DuplicateActiveCopies_StillBlockAmbiguousCacheUpdates()
+    public void NineSameHeaderFiles_SynchronizeOnlyIndexedCanonicalRollout()
     {
         CreateDatabases();
         var active = CreateRollout("active", "crs", false, "\n", false);
+        var sessions = Path.Combine(_root, "sessions");
+        var untouched = new Dictionary<string, byte[]>();
+        for (var index = 1; index < 9; index++)
+        {
+            var copy = Path.Combine(sessions, $"active-copy-{index}.jsonl");
+            File.Copy(active, copy);
+            untouched.Add(copy, File.ReadAllBytes(copy));
+        }
+        var invalid = Path.Combine(sessions, "unindexed-broken.jsonl");
+        var compressed = Path.Combine(sessions, "unindexed-compressed.jsonl.zst");
+        File.WriteAllText(invalid, "{invalid unindexed history");
+        File.WriteAllText(compressed, "not read");
+        untouched.Add(invalid, File.ReadAllBytes(invalid));
+        untouched.Add(compressed, File.ReadAllBytes(compressed));
+        var message = ReadMessage(active);
+
+        var result = _service.SwitchProfile("api-a");
+
+        AssertProvider(active, "my-provider");
+        Assert.Equal(message, ReadMessage(active));
+        Assert.Equal("my-provider", TextScalar(StatePath, "SELECT model_provider FROM threads"));
+        Assert.Equal(new FileInfo(active).Length, Scalar(HistoryPath, "SELECT next_rollout_byte_offset FROM thread_history_projection_state"));
+        Assert.Equal(1, result.SynchronizedThreads);
+        Assert.Single(Directory.GetFiles(Path.Combine(result.BackupPath, "continuity"), "rollout-*.jsonl"));
+        foreach (var file in untouched) Assert.Equal(file.Value, File.ReadAllBytes(file.Key));
+    }
+
+    [Fact]
+    public void ForksWithSharedParentHeader_UseDatabaseIdsForIndependentHistoryOffsets()
+    {
+        CreateDatabases();
+        var parent = CreateRollout("parent", "crs", true, "\n", false);
+        var first = CreateRollout("fork-a", "crs", false, "\n", false);
+        var second = CreateRollout("fork-b", "crs", false, "\n", false);
+        var parentBytes = File.ReadAllBytes(parent);
+        var parentOffset = Scalar(HistoryPath, "SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id = 'parent'");
+        foreach (var path in new[] { first, second })
+            File.WriteAllText(path, File.ReadAllText(parent) + File.ReadAllText(path), new UTF8Encoding(false));
+        var firstMessage = ReadMessage(first);
+        var secondMessage = ReadMessage(second);
+        // These cursors intentionally point to different positions: one after
+        // the inherited header, one after every inherited and own record.
+        Execute(HistoryPath, $"UPDATE thread_history_projection_state SET next_rollout_byte_offset = {FirstLineByteLength(first)} WHERE thread_id = 'fork-a'");
+        Execute(HistoryPath, $"UPDATE thread_history_projection_state SET next_rollout_byte_offset = {new FileInfo(second).Length} WHERE thread_id = 'fork-b'");
+        var metadata = ReadMetadata();
+
+        var result = _service.SwitchProfile("api-a");
+
+        Assert.Equal(2, result.SynchronizedThreads);
+        Assert.Equal(metadata, ReadMetadata());
+        Assert.Equal(parentBytes, File.ReadAllBytes(parent));
+        Assert.Equal("crs", TextScalar(StatePath, "SELECT model_provider FROM threads WHERE id = 'parent'"));
+        Assert.Equal(parentOffset, Scalar(HistoryPath, "SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id = 'parent'"));
+        Assert.Equal(FirstLineByteLength(first), Scalar(HistoryPath, "SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id = 'fork-a'"));
+        Assert.Equal(new FileInfo(second).Length, Scalar(HistoryPath, "SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id = 'fork-b'"));
+        Assert.Equal(firstMessage, ReadMessage(first));
+        Assert.Equal(secondMessage, ReadMessage(second));
+        foreach (var (path, id) in new[] { (first, "fork-a"), (second, "fork-b") })
+        {
+            var ids = new List<string>();
+            foreach (var line in File.ReadAllLines(path))
+            {
+                using var document = JsonDocument.Parse(line);
+                var root = document.RootElement;
+                var payload = root.GetProperty("payload");
+                if (root.GetProperty("type").GetString() == "session_meta")
+                {
+                    ids.Add(payload.GetProperty("id").GetString()!);
+                    Assert.Equal("my-provider", payload.GetProperty("model_provider").GetString());
+                }
+                else if (root.GetProperty("type").GetString() == "event_msg")
+                    Assert.Equal("my-provider", payload.GetProperty("thread_settings").GetProperty("model_provider_id").GetString());
+            }
+            Assert.Equal(new[] { "parent", id }, ids);
+            Assert.Equal("my-provider", TextScalar(StatePath, $"SELECT model_provider FROM threads WHERE id = '{id}'"));
+        }
+        Assert.Equal(3L, Scalar(HistoryPath, "SELECT COUNT(*) FROM thread_items"));
+    }
+
+    [Theory]
+    [InlineData("\n", false)]
+    [InlineData("\r\n", true)]
+    public void SuffixedCanonicalRollout_ShiftsPhysicalCacheAndTurnOffsets_NotLogicalOriginal(string newline, bool bom)
+    {
+        const string logicalId = "11111111-1111-4111-8111-111111111111";
+        const string physicalId = "22222222-2222-4222-8222-222222222222";
+        CreateDatabases();
+        var initial = CreateRollout(logicalId, "crs", false, newline, bom);
+        var directory = Path.GetDirectoryName(initial)!;
+        var canonical = Path.Combine(directory, $"rollout-2026-09-15T00-00-00-{logicalId}_{physicalId}.jsonl");
+        var original = Path.Combine(directory, $"rollout-2026-09-15T00-00-00-{logicalId}.jsonl");
+        File.Move(initial, canonical);
+        // The original is a separate, immutable, longer rollout with the same
+        // logical header. Only the suffixed physical rollout is currently used.
+        File.WriteAllText(original, File.ReadAllText(canonical) + File.ReadAllLines(canonical).Last() + newline, new UTF8Encoding(bom));
+        var originalBytes = File.ReadAllBytes(original);
+        var originalLength = new FileInfo(original).Length;
+        var originalStart = FirstLineByteLength(original);
+        var canonicalLength = new FileInfo(canonical).Length;
+        var canonicalStart = FirstLineByteLength(canonical);
+        var message = ReadMessage(canonical);
+        using (var state = Open(StatePath))
+        using (var update = state.CreateCommand())
+        {
+            update.CommandText = "UPDATE threads SET rollout_path = $path WHERE id = $id";
+            update.Parameters.AddWithValue("$path", canonical);
+            update.Parameters.AddWithValue("$id", logicalId);
+            update.ExecuteNonQuery();
+        }
+        Execute(HistoryPath, $"""
+            UPDATE thread_history_projection_state SET next_rollout_byte_offset = {originalLength} WHERE thread_id = '{logicalId}';
+            INSERT INTO thread_history_projection_state VALUES ('{physicalId}', {canonicalLength}, 3);
+            INSERT INTO thread_turns (thread_id, turn_id, rollout_ordinal, status, rollout_byte_offset, rollout_end_ordinal, rollout_end_byte_offset)
+                VALUES ('{logicalId}', 'old-turn', 1, 'completed', {originalStart}, 4, {originalLength}),
+                       ('{physicalId}', 'current-turn', 1, 'completed', {canonicalStart}, 3, {canonicalLength}),
+                       ('{physicalId}', 'pending-turn', 4, 'inProgress', NULL, NULL, NULL);
+            INSERT INTO thread_items VALUES ('{physicalId}', 'physical rollout message stays unchanged');
+            """);
+        var turnMetadata = TextScalar(HistoryPath, "SELECT group_concat(thread_id || turn_id || rollout_ordinal || status || coalesce(rollout_end_ordinal, 'NULL'), '|') FROM (SELECT * FROM thread_turns ORDER BY thread_id, turn_id)");
+
+        var result = _service.SwitchProfile("api-a");
+
+        Assert.Equal(1, result.SynchronizedThreads);
+        AssertProvider(canonical, "my-provider");
+        Assert.Equal(message, ReadMessage(canonical));
+        using (var header = JsonDocument.Parse(File.ReadAllLines(canonical)[0]))
+            Assert.Equal(logicalId, header.RootElement.GetProperty("payload").GetProperty("id").GetString());
+        Assert.Equal(originalBytes, File.ReadAllBytes(original));
+        Assert.Equal(originalLength, Scalar(HistoryPath, $"SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id = '{logicalId}'"));
+        Assert.Equal(originalStart, Scalar(HistoryPath, $"SELECT rollout_byte_offset FROM thread_turns WHERE thread_id = '{logicalId}'"));
+        Assert.Equal(originalLength, Scalar(HistoryPath, $"SELECT rollout_end_byte_offset FROM thread_turns WHERE thread_id = '{logicalId}'"));
+        Assert.Equal(new FileInfo(canonical).Length, Scalar(HistoryPath, $"SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id = '{physicalId}'"));
+        Assert.Equal(FirstLineByteLength(canonical), Scalar(HistoryPath, $"SELECT rollout_byte_offset FROM thread_turns WHERE thread_id = '{physicalId}' AND turn_id = 'current-turn'"));
+        Assert.Equal(new FileInfo(canonical).Length, Scalar(HistoryPath, $"SELECT rollout_end_byte_offset FROM thread_turns WHERE thread_id = '{physicalId}' AND turn_id = 'current-turn'"));
+        Assert.Equal(1L, Scalar(HistoryPath, $"SELECT COUNT(*) FROM thread_turns WHERE thread_id = '{physicalId}' AND turn_id = 'pending-turn' AND rollout_byte_offset IS NULL AND rollout_end_byte_offset IS NULL"));
+        Assert.Equal(turnMetadata, TextScalar(HistoryPath, "SELECT group_concat(thread_id || turn_id || rollout_ordinal || status || coalesce(rollout_end_ordinal, 'NULL'), '|') FROM (SELECT * FROM thread_turns ORDER BY thread_id, turn_id)"));
+        Assert.Equal("physical rollout message stays unchanged", TextScalar(HistoryPath, $"SELECT item_json FROM thread_items WHERE thread_id = '{physicalId}'"));
+        Assert.Single(Directory.GetFiles(Path.Combine(result.BackupPath, "continuity"), "rollout-*.jsonl"));
+    }
+
+    [Fact]
+    public void OrphanHistoryDatabaseWithoutState_PreventsAllChanges()
+    {
+        CreateDatabases();
+        var rollout = CreateRollout("first", "crs", false, "\n", false);
+        File.Delete(StatePath);
+        var before = new[] { rollout, Path.Combine(_root, "config.toml"), Path.Combine(_root, "auth.json") }
+            .ToDictionary(path => path, File.ReadAllBytes);
+        var offset = Scalar(HistoryPath, "SELECT next_rollout_byte_offset FROM thread_history_projection_state");
+
+        Assert.Throws<IOException>(() => _service.SwitchProfile("api-a"));
+
+        foreach (var file in before) Assert.Equal(file.Value, File.ReadAllBytes(file.Key));
+        Assert.Equal(offset, Scalar(HistoryPath, "SELECT next_rollout_byte_offset FROM thread_history_projection_state"));
+        Assert.False(File.Exists(StatePath));
+    }
+
+    [Fact]
+    public void TurnOffsetsWithoutProjectionCursor_AreStillShifted()
+    {
+        CreateDatabases();
+        var path = CreateRollout("first", "crs", false, "\n", false);
+        Execute(HistoryPath, $"""
+            DELETE FROM thread_history_projection_state;
+            INSERT INTO thread_turns (thread_id, turn_id, rollout_ordinal, status, rollout_byte_offset, rollout_end_byte_offset)
+                VALUES ('first', 'turn', 1, 'completed', {FirstLineByteLength(path)}, {new FileInfo(path).Length});
+            """);
+
+        _service.SwitchProfile("api-a");
+
+        Assert.Equal(FirstLineByteLength(path), Scalar(HistoryPath, "SELECT rollout_byte_offset FROM thread_turns"));
+        Assert.Equal(new FileInfo(path).Length, Scalar(HistoryPath, "SELECT rollout_end_byte_offset FROM thread_turns"));
+        Assert.Equal(0L, Scalar(HistoryPath, "SELECT COUNT(*) FROM thread_history_projection_state"));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void InvalidTurnOffset_PreventsPartialMigration(bool beyondEnd)
+    {
+        CreateDatabases();
+        var path = CreateRollout("first", "crs", false, "\n", false);
+        var length = new FileInfo(path).Length;
+        var invalidOffset = beyondEnd ? length + 1 : 1;
+        Execute(HistoryPath, $"""
+            INSERT INTO thread_turns (thread_id, turn_id, rollout_ordinal, status, rollout_byte_offset, rollout_end_byte_offset)
+                VALUES ('first', 'turn', 1, 'completed', {invalidOffset}, {length});
+            """);
+        var before = new[] { path, Path.Combine(_root, "config.toml"), Path.Combine(_root, "auth.json") }
+            .ToDictionary(file => file, File.ReadAllBytes);
+
+        Assert.Throws<IOException>(() => _service.SwitchProfile("api-a"));
+
+        foreach (var file in before) Assert.Equal(file.Value, File.ReadAllBytes(file.Key));
+        Assert.Equal("crs", TextScalar(StatePath, "SELECT model_provider FROM threads"));
+        Assert.Equal(length, Scalar(HistoryPath, "SELECT next_rollout_byte_offset FROM thread_history_projection_state"));
+        Assert.Equal(invalidOffset, Scalar(HistoryPath, "SELECT rollout_byte_offset FROM thread_turns"));
+        Assert.Equal(length, Scalar(HistoryPath, "SELECT rollout_end_byte_offset FROM thread_turns"));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void PaginatedIndexedRollout_CreatesCanonicalGeneration_KeepingImmutableHistoryAndCaches(bool withSettings)
+    {
+        const string logicalId = "33333333-3333-4333-8333-333333333333";
+        const string physicalId = "44444444-4444-4444-8444-444444444444";
+        const string sourceId = "55555555-5555-4555-8555-555555555555";
+        CreateDatabases();
+        var initial = CreateRollout(logicalId, "crs", false, "\n", false);
+        var directory = Path.GetDirectoryName(initial)!;
+        var canonical = Path.Combine(directory, $"rollout-2026-09-15T00-00-00-{logicalId}_{physicalId}.jsonl");
+        File.Move(initial, canonical);
+        var lines = File.ReadAllLines(canonical).Select(line => JsonNode.Parse(line)!).ToList();
+        lines[0]["payload"]!["history_mode"] = "paginated";
+        lines[0]["payload"]!["history_base"] = new JsonObject
+        {
+            ["thread_id"] = sourceId,
+            ["end_ordinal_exclusive"] = 100,
+            ["end_byte_offset"] = 10000
+        };
+        lines[1]["payload"]!["thread_id"] = sourceId;
+        if (!withSettings) lines.RemoveAt(1);
+        for (var index = 0; index < lines.Count; index++) lines[index]["ordinal"] = 100 + index;
+        File.WriteAllText(canonical, string.Join("\n", lines.Select(line => line.ToJsonString())) + "\n", new UTF8Encoding(false));
+        var length = new FileInfo(canonical).Length;
+        // An excluded descendant references exact bytes in this physical file.
+        // Rewriting any prior record would invalidate its immutable boundary.
+        var descendant = Path.Combine(directory, "unindexed-descendant.jsonl");
+        var descendantHeader = lines[0].DeepClone();
+        descendantHeader["payload"]!["history_base"] = new JsonObject
+        {
+            ["thread_id"] = physicalId,
+            ["end_ordinal_exclusive"] = 100 + lines.Count,
+            ["end_byte_offset"] = length
+        };
+        File.WriteAllText(descendant, descendantHeader.ToJsonString() + "\n", new UTF8Encoding(false));
+        using (var state = Open(StatePath))
+        using (var update = state.CreateCommand())
+        {
+            update.CommandText = "UPDATE threads SET rollout_path = $path WHERE id = $id";
+            update.Parameters.AddWithValue("$path", canonical);
+            update.Parameters.AddWithValue("$id", logicalId);
+            update.ExecuteNonQuery();
+        }
+        Execute(HistoryPath, $"""
+            UPDATE thread_history_projection_state SET next_rollout_byte_offset = 10000 WHERE thread_id = '{logicalId}';
+            INSERT INTO thread_history_projection_state VALUES ('{physicalId}', {length}, {100 + lines.Count});
+            INSERT INTO thread_turns (thread_id, turn_id, rollout_ordinal, status, rollout_byte_offset, rollout_end_ordinal, rollout_end_byte_offset)
+                VALUES ('{logicalId}', 'original-turn', 1, 'completed', 200, 100, 10000),
+                       ('{physicalId}', 'physical-turn', 101, 'completed', {FirstLineByteLength(canonical)}, {100 + lines.Count}, {length}),
+                       ('{physicalId}', 'pending-turn', 104, 'inProgress', NULL, NULL, NULL);
+            """);
+        var before = new[] { canonical, descendant, HistoryPath }.ToDictionary(path => path, File.ReadAllBytes);
+        var metadata = ReadMetadata();
+        var message = ReadMessage(canonical);
+        var current = canonical;
+
+        foreach (var profile in new[] { "api-a", "account-a", "api-b" })
+        {
+            _service.SwitchProfile(profile);
+            var provider = profile == "api-a" ? "my-provider" : profile == "api-b" ? "second-provider" : "openai";
+            Assert.Equal(provider, TextScalar(StatePath, "SELECT model_provider FROM threads"));
+            var next = TextScalar(StatePath, "SELECT rollout_path FROM threads");
+            Assert.NotEqual(current, next);
+            Assert.Equal(directory, Path.GetDirectoryName(next));
+            Assert.True(File.Exists(next));
+            Assert.StartsWith("rollout-", Path.GetFileName(next));
+            Assert.EndsWith(".jsonl", next);
+            Assert.Contains(logicalId + "_", Path.GetFileName(next));
+            var nextPhysicalId = Path.GetFileNameWithoutExtension(next).Split('_').Last();
+            Assert.True(Guid.TryParseExact(nextPhysicalId, "D", out _));
+            Assert.NotEqual(logicalId, nextPhysicalId);
+            Assert.NotEqual(physicalId, nextPhysicalId);
+            Assert.Equal(0L, Scalar(HistoryPath, $"SELECT COUNT(*) FROM thread_history_projection_state WHERE thread_id = '{nextPhysicalId}'"));
+            Assert.Equal(0L, Scalar(HistoryPath, $"SELECT COUNT(*) FROM thread_turns WHERE thread_id = '{nextPhysicalId}'"));
+            Assert.Equal(message, ReadMessage(next));
+            var nextLines = File.ReadAllLines(next);
+            Assert.Equal(lines.Count, nextLines.Length);
+            for (var index = 0; index < lines.Count; index++)
+            {
+                var expected = lines[index].DeepClone();
+                if (expected["type"]!.GetValue<string>() == "session_meta")
+                    expected["payload"]!["model_provider"] = provider;
+                else if (expected["type"]!.GetValue<string>() == "event_msg")
+                    expected["payload"]!["thread_settings"]!["model_provider_id"] = provider;
+                Assert.True(JsonNode.DeepEquals(expected, JsonNode.Parse(nextLines[index])), $"Unexpected changes to rollout record {index}");
+            }
+            Assert.Equal(metadata, ReadMetadata());
+            foreach (var file in before) Assert.Equal(file.Value, File.ReadAllBytes(file.Key));
+            before.Add(next, File.ReadAllBytes(next));
+            current = next;
+            var fileCount = Directory.GetFiles(directory).Length;
+            // Repeating the same provider must not create another generation.
+            _service.SwitchProfile(profile);
+            Assert.Equal(current, TextScalar(StatePath, "SELECT rollout_path FROM threads"));
+            Assert.Equal(fileCount, Directory.GetFiles(directory).Length);
+            foreach (var file in before) Assert.Equal(file.Value, File.ReadAllBytes(file.Key));
+        }
+    }
+
+    [Fact]
+    public void PaginatedRolloutWithoutState_PreventsAllChanges()
+    {
+        var path = CreateRollout("first", "crs", false, "\n", false, false);
+        var lines = File.ReadAllLines(path);
+        var header = JsonNode.Parse(lines[0])!;
+        header["payload"]!["history_mode"] = "paginated";
+        lines[0] = header.ToJsonString();
+        File.WriteAllText(path, string.Join("\n", lines) + "\n", new UTF8Encoding(false));
+        var before = new[] { path, Path.Combine(_root, "config.toml"), Path.Combine(_root, "auth.json") }
+            .ToDictionary(file => file, File.ReadAllBytes);
+
+        Assert.Throws<IOException>(() => _service.SwitchProfile("api-a"));
+
+        foreach (var file in before) Assert.Equal(file.Value, File.ReadAllBytes(file.Key));
+        Assert.False(File.Exists(StatePath));
+    }
+
+    [Fact]
+    public void PaginatedFailedAuthWrite_RestoresCanonicalPathWithoutLeavingNewGeneration()
+    {
+        const string id = "66666666-6666-4666-8666-666666666666";
+        CreateDatabases();
+        var path = CreateRollout(id, "crs", false, "\n", false);
+        var lines = File.ReadAllLines(path);
+        var header = JsonNode.Parse(lines[0])!;
+        header["payload"]!["history_mode"] = "paginated";
+        lines[0] = header.ToJsonString();
+        File.WriteAllText(path, string.Join("\n", lines) + "\n", new UTF8Encoding(false));
+        Execute(HistoryPath, $"UPDATE thread_history_projection_state SET next_rollout_byte_offset = {new FileInfo(path).Length}");
+        var before = new[] { path, HistoryPath, Path.Combine(_root, "config.toml"), Path.Combine(_root, "auth.json") }
+            .ToDictionary(file => file, File.ReadAllBytes);
+        var directory = Path.GetDirectoryName(path)!;
+        var originalFiles = Directory.GetFiles(directory).OrderBy(file => file).ToArray();
+
+        using (var authLock = File.Open(Path.Combine(_root, "auth.json"), FileMode.Open, FileAccess.Read, FileShare.Read))
+            Assert.Throws<IOException>(() => _service.SwitchProfile("api-a"));
+
+        foreach (var file in before) Assert.Equal(file.Value, File.ReadAllBytes(file.Key));
+        Assert.Equal(path, TextScalar(StatePath, "SELECT rollout_path FROM threads"));
+        Assert.Equal("crs", TextScalar(StatePath, "SELECT model_provider FROM threads"));
+        Assert.Equal(originalFiles, Directory.GetFiles(directory).OrderBy(file => file).ToArray());
+    }
+
+    [Theory]
+    [InlineData("crs", "crs")]
+    [InlineData("my-provider", "crs")]
+    [InlineData("my-provider", "my-provider")]
+    public void RolloutOnlyDuplicateIdentities_StillBlockAmbiguousUpdates(string firstProvider, string copyProvider)
+    {
+        var active = CreateRollout("active", firstProvider, false, "\n", false, false);
+        var copy = CreateRollout("active-copy", copyProvider, false, "\n", false, false);
+        var lines = File.ReadAllLines(copy);
+        var header = JsonNode.Parse(lines[0])!;
+        header["payload"]!["id"] = "active";
+        lines[0] = header.ToJsonString();
+        File.WriteAllText(copy, string.Join("\n", lines) + "\n", new UTF8Encoding(false));
         var bytes = File.ReadAllBytes(active);
-        File.Copy(active, Path.Combine(_root, "sessions", "active-copy.jsonl"));
+        var copyBytes = File.ReadAllBytes(copy);
+        var auth = File.ReadAllBytes(Path.Combine(_root, "auth.json"));
+
         var error = Assert.Throws<IOException>(() => _service.SwitchProfile("api-a"));
+
         Assert.Contains("Duplicate session identity", error.Message);
         Assert.Equal(bytes, File.ReadAllBytes(active));
-        Assert.Equal("crs", TextScalar(StatePath, "SELECT model_provider FROM threads"));
+        Assert.Equal(copyBytes, File.ReadAllBytes(copy));
+        Assert.Equal(auth, File.ReadAllBytes(Path.Combine(_root, "auth.json")));
+        Assert.False(File.Exists(StatePath));
+    }
+
+    [Fact]
+    public void DistinctDatabaseIdsSharingCanonicalPath_PreventAllChanges()
+    {
+        CreateDatabases();
+        var first = CreateRollout("first", "crs", false, "\n", false);
+        var second = CreateRollout("second", "krill", false, "\n", false);
+        Execute(StatePath, "UPDATE threads SET rollout_path = (SELECT rollout_path FROM threads WHERE id = 'first') WHERE id = 'second'");
+        var before = new[] { first, second, Path.Combine(_root, "config.toml"), Path.Combine(_root, "auth.json") }
+            .ToDictionary(path => path, File.ReadAllBytes);
+        var firstOffset = Scalar(HistoryPath, "SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id = 'first'");
+        var secondOffset = Scalar(HistoryPath, "SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id = 'second'");
+
+        Assert.Throws<IOException>(() => _service.SwitchProfile("api-a"));
+
+        foreach (var file in before) Assert.Equal(file.Value, File.ReadAllBytes(file.Key));
+        Assert.Equal("crs", TextScalar(StatePath, "SELECT model_provider FROM threads WHERE id = 'first'"));
+        Assert.Equal("krill", TextScalar(StatePath, "SELECT model_provider FROM threads WHERE id = 'second'"));
+        Assert.Equal(firstOffset, Scalar(HistoryPath, "SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id = 'first'"));
+        Assert.Equal(secondOffset, Scalar(HistoryPath, "SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id = 'second'"));
+    }
+
+    [Fact]
+    public void ActiveAndArchivedDatabaseIdsSharingCanonicalPath_PreventAllChanges()
+    {
+        CreateDatabases();
+        var active = CreateRollout("active", "crs", false, "\n", false);
+        var archived = CreateRollout("archived", "krill", true, "\n", false);
+        Execute(StatePath, "UPDATE threads SET rollout_path = (SELECT rollout_path FROM threads WHERE id = 'active') WHERE id = 'archived'");
+        var before = new[] { active, archived, Path.Combine(_root, "config.toml"), Path.Combine(_root, "auth.json") }
+            .ToDictionary(path => path, File.ReadAllBytes);
+        var activeOffset = Scalar(HistoryPath, "SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id = 'active'");
+        var archivedOffset = Scalar(HistoryPath, "SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id = 'archived'");
+
+        Assert.Throws<IOException>(() => _service.SwitchProfile("api-a"));
+
+        foreach (var file in before) Assert.Equal(file.Value, File.ReadAllBytes(file.Key));
+        Assert.Equal("crs", TextScalar(StatePath, "SELECT model_provider FROM threads WHERE id = 'active'"));
+        Assert.Equal("krill", TextScalar(StatePath, "SELECT model_provider FROM threads WHERE id = 'archived'"));
+        Assert.Equal(activeOffset, Scalar(HistoryPath, "SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id = 'active'"));
+        Assert.Equal(archivedOffset, Scalar(HistoryPath, "SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id = 'archived'"));
     }
 
     [Fact]
@@ -139,12 +544,19 @@ public sealed class ThreadContinuityTests : IDisposable
         var bytes = File.ReadAllBytes(path);
         var config = File.ReadAllBytes(Path.Combine(_root, "config.toml"));
         var offset = Scalar(HistoryPath, "SELECT next_rollout_byte_offset FROM thread_history_projection_state");
+        var turnStart = FirstLineByteLength(path);
+        Execute(HistoryPath, $"""
+            INSERT INTO thread_turns (thread_id, turn_id, rollout_ordinal, status, rollout_byte_offset, rollout_end_byte_offset)
+                VALUES ('first', 'turn', 1, 'completed', {turnStart}, {offset});
+            """);
         using (var authLock = File.Open(Path.Combine(_root, "auth.json"), FileMode.Open, FileAccess.Read, FileShare.Read))
             Assert.Throws<IOException>(() => _service.SwitchProfile("api-a"));
         Assert.Equal(bytes, File.ReadAllBytes(path));
         Assert.Equal(config, File.ReadAllBytes(Path.Combine(_root, "config.toml")));
         Assert.Equal("openai", TextScalar(StatePath, "SELECT model_provider FROM threads"));
         Assert.Equal(offset, Scalar(HistoryPath, "SELECT next_rollout_byte_offset FROM thread_history_projection_state"));
+        Assert.Equal(turnStart, Scalar(HistoryPath, "SELECT rollout_byte_offset FROM thread_turns"));
+        Assert.Equal(offset, Scalar(HistoryPath, "SELECT rollout_end_byte_offset FROM thread_turns"));
         // The rolled-back journal must allow a retry.
         _service.SwitchProfile("api-b");
         AssertProvider(path, "second-provider");
@@ -162,15 +574,16 @@ public sealed class ThreadContinuityTests : IDisposable
     }
 
     [Fact]
-    public void InvalidRollout_PreventsPartialMigration()
+    public void InvalidIndexedRollout_PreventsPartialMigration()
     {
         CreateDatabases();
         var first = CreateRollout("first", "crs", false, "\n", false);
         var bytes = File.ReadAllBytes(first);
-        File.WriteAllText(Path.Combine(_root, "sessions", "broken.jsonl"), "{invalid");
+        var broken = CreateRollout("broken", "crs", false, "\n", false);
+        File.WriteAllText(broken, "{invalid");
         Assert.Throws<IOException>(() => _service.SwitchProfile("api-a"));
         Assert.Equal(bytes, File.ReadAllBytes(first));
-        Assert.Equal("crs", TextScalar(StatePath, "SELECT model_provider FROM threads"));
+        Assert.Equal(0L, Scalar(StatePath, "SELECT COUNT(*) FROM threads WHERE model_provider != 'crs'"));
         Assert.Equal("chatgpt", _service.GetEnvironment().CurrentAuthMode);
     }
 
@@ -287,6 +700,12 @@ public sealed class ThreadContinuityTests : IDisposable
         Execute(HistoryPath, """
             CREATE TABLE thread_history_projection_state (thread_id TEXT PRIMARY KEY, next_rollout_byte_offset INTEGER, next_rollout_ordinal INTEGER);
             CREATE TABLE thread_items (thread_id TEXT, item_json TEXT);
+            CREATE TABLE thread_turns (
+                thread_id TEXT NOT NULL, turn_id TEXT NOT NULL, rollout_ordinal INTEGER NOT NULL,
+                status TEXT NOT NULL, error_json TEXT, started_at INTEGER, completed_at INTEGER,
+                duration_ms INTEGER, first_user_item_id TEXT, final_agent_item_id TEXT,
+                rollout_byte_offset INTEGER, rollout_end_ordinal INTEGER, rollout_end_byte_offset INTEGER,
+                PRIMARY KEY (thread_id, turn_id));
             """);
     }
 
@@ -320,6 +739,7 @@ public sealed class ThreadContinuityTests : IDisposable
     }
 
     private static byte[] ReadMessage(string path) => Encoding.UTF8.GetBytes(File.ReadAllLines(path).Last());
+    private static long FirstLineByteLength(string path) => Array.IndexOf(File.ReadAllBytes(path), (byte)'\n') + 1L;
     private static void AssertProvider(string path, string provider)
     {
         var lines = File.ReadAllLines(path);

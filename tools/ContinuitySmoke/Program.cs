@@ -6,7 +6,10 @@ if (!Path.GetFileName(root).StartsWith("switcher-smoke-", StringComparison.Ordin
 var runtime = new FakeRuntime();
 var inspector = new LiveAuthInspector(runtime);
 var service = new CodexAuthSwitcherService(new ProfileStore(root, new ProtectedSecretStore(), inspector), inspector, runtime);
-service.SaveApiProfile(new ApiProfileSpec { Name = "smoke", Provider = args[1], BaseUrl = "http://127.0.0.1:1/v1", ApiKey = "isolated-fake-key" });
+var baseUrl = Environment.GetEnvironmentVariable("SWITCHER_SMOKE_BASE_URL") ?? "http://127.0.0.1:1/v1";
+if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out var endpoint) || !endpoint.IsLoopback)
+    throw new InvalidOperationException("Smoke tests require a loopback endpoint.");
+service.SaveApiProfile(new ApiProfileSpec { Name = "smoke", Provider = args[1], BaseUrl = baseUrl, ApiKey = "isolated-fake-key" });
 var result = service.SwitchProfile("smoke");
 Console.WriteLine($"provider={service.GetEnvironment().ModelProvider} synchronized={result.SynchronizedThreads}");
 sealed class FakeRuntime : ICodexRuntimeEnvironmentService
