@@ -30,13 +30,15 @@ public sealed class ThreadContinuityTests : IDisposable
     }
 
     [Fact]
-    public void RoundTrip_ListsSameIdsUnderEveryProvider_AndPreservesMessagesSidebarAndArchive()
+    public void RoundTrip_ListsActiveIdsUnderEveryProvider_AndLeavesArchiveUntouched()
     {
         CreateDatabases();
         var first = CreateRollout("first", "crs", false, "\r\n", true);
         var archived = CreateRollout("archived", "krill", true, "\n", false);
         var originalMessage = ReadMessage(first);
         var originalArchiveMessage = ReadMessage(archived);
+        var archiveBytes = File.ReadAllBytes(archived);
+        var archiveOffset = Scalar(HistoryPath, "SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id = 'archived'");
         var snapshot = ReadMetadata();
         foreach (var profile in new[] { "api-a", "account-a", "api-b", "account-b", "api-a" })
         {
@@ -49,18 +51,84 @@ public sealed class ThreadContinuityTests : IDisposable
             using var reader = query.ExecuteReader();
             var visibleIds = new List<string>();
             while (reader.Read()) visibleIds.Add(reader.GetString(0));
-            Assert.Equal(new[] { "archived", "first" }, visibleIds);
+            Assert.Equal(new[] { "first" }, visibleIds);
             Assert.Equal(snapshot, ReadMetadata());
             Assert.Equal(originalMessage, ReadMessage(first));
             Assert.Equal(originalArchiveMessage, ReadMessage(archived));
             AssertProvider(first, provider);
-            AssertProvider(archived, provider);
+            AssertProvider(archived, "krill");
+            Assert.Equal(archiveBytes, File.ReadAllBytes(archived));
+            Assert.Equal("krill", TextScalar(StatePath, "SELECT model_provider FROM threads WHERE id = 'archived'"));
+            Assert.Equal(archiveOffset, Scalar(HistoryPath, "SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id = 'archived'"));
+            Assert.Equal(1, result.SynchronizedThreads);
             Assert.Equal(new FileInfo(first).Length, Scalar(HistoryPath, "SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id = 'first'"));
             Assert.Equal(2L, Scalar(HistoryPath, "SELECT COUNT(*) FROM thread_items"));
             Assert.Equal("body with crs and openai unchanged", TextScalar(HistoryPath, "SELECT item_json FROM thread_items WHERE thread_id = 'first'"));
             Assert.True(File.Exists(Path.Combine(result.BackupPath, "continuity", "state_5.sqlite")));
             Assert.Equal(profile, _service.EnsureCurrentIdentityTracked().MatchedProfileName);
         }
+    }
+
+    [Fact]
+    public void DuplicateArchivedCopies_AndInvalidOrCompressedArchives_DoNotBlockSwitch()
+    {
+        CreateDatabases();
+        var active = CreateRollout("shared", "crs", false, "\n", false);
+        var archived = CreateRollout("shared", "crs", true, "\n", false, false);
+        var archiveDirectory = Path.GetDirectoryName(archived)!;
+        for (var index = 1; index < 5; index++)
+            File.Copy(archived, Path.Combine(archiveDirectory, $"shared-copy-{index}.jsonl"));
+        File.WriteAllText(Path.Combine(archiveDirectory, "broken.jsonl"), "{invalid archive");
+        File.WriteAllText(Path.Combine(archiveDirectory, "compressed.jsonl.zst"), "not read");
+        var before = Directory.GetFiles(archiveDirectory).ToDictionary(path => path, File.ReadAllBytes);
+
+        var result = _service.SwitchProfile("api-a");
+
+        AssertProvider(active, "my-provider");
+        Assert.Equal(1, result.SynchronizedThreads);
+        Assert.Equal(new FileInfo(active).Length, Scalar(HistoryPath, "SELECT next_rollout_byte_offset FROM thread_history_projection_state"));
+        foreach (var file in before) Assert.Equal(file.Value, File.ReadAllBytes(file.Key));
+        Assert.Equal(before.Count, Directory.GetFiles(archiveDirectory).Length);
+        Assert.Single(Directory.GetFiles(Path.Combine(result.BackupPath, "continuity"), "rollout-*.jsonl"));
+    }
+
+    [Theory]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public void ArchivedFlagOrDirectory_ExcludesDatabaseRowFileAndHistoryCache(bool archiveFlag, bool archiveDirectory)
+    {
+        CreateDatabases();
+        var archived = CreateRollout("archived", "krill", archiveDirectory, "\n", false);
+        Execute(StatePath, $"UPDATE threads SET archived = {(archiveFlag ? 1 : 0)} WHERE id = 'archived'");
+        var bytes = File.ReadAllBytes(archived);
+        var offset = Scalar(HistoryPath, "SELECT next_rollout_byte_offset FROM thread_history_projection_state");
+        // An unindexed copy in sessions must not shift the archived ID's cache.
+        Directory.CreateDirectory(Path.Combine(_root, "sessions"));
+        var copy = Path.Combine(_root, "sessions", "stray-archive-copy.jsonl");
+        File.Copy(archived, copy);
+        CreateRollout("active", "crs", false, "\n", false);
+
+        var result = _service.SwitchProfile("api-a");
+
+        Assert.Equal(1, result.SynchronizedThreads);
+        Assert.Equal(bytes, File.ReadAllBytes(archived));
+        Assert.Equal(bytes, File.ReadAllBytes(copy));
+        Assert.Equal("krill", TextScalar(StatePath, "SELECT model_provider FROM threads WHERE id = 'archived'"));
+        Assert.Equal(offset, Scalar(HistoryPath, "SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id = 'archived'"));
+    }
+
+    [Fact]
+    public void DuplicateActiveCopies_StillBlockAmbiguousCacheUpdates()
+    {
+        CreateDatabases();
+        var active = CreateRollout("active", "crs", false, "\n", false);
+        var bytes = File.ReadAllBytes(active);
+        File.Copy(active, Path.Combine(_root, "sessions", "active-copy.jsonl"));
+        var error = Assert.Throws<IOException>(() => _service.SwitchProfile("api-a"));
+        Assert.Contains("Duplicate session identity", error.Message);
+        Assert.Equal(bytes, File.ReadAllBytes(active));
+        Assert.Equal("crs", TextScalar(StatePath, "SELECT model_provider FROM threads"));
     }
 
     [Fact]

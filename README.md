@@ -11,13 +11,15 @@ A Windows app for switching ChatGPT accounts and API profiles while continuing t
 
 Use the installer for normal use, or run the portable executable directly. Windows x64; the release includes the .NET runtime.
 
-## What changed in v1.2.0
+## What changed in v1.2.1
+
+Archived conversations are now skipped. Duplicate IDs, invalid JSONL, or compressed files inside `archived_sessions` no longer block an ordinary switch. Archive files, archived thread rows, and their cache offsets remain unchanged. To continue an archived conversation on a new provider later, unarchive it in Codex and switch again.
 
 The provider name you enter is now the actual Codex provider ID. The old compatibility flag no longer silently forces it to `openai`.
 
 Codex filters its default thread list by provider and can restore the provider saved with a conversation. Keeping files untouched was insufficient: conversations saved under a different provider could disappear from the list or resume with an old route. On each switch, the app now backs up and synchronizes local conversation routing metadata with the selected provider.
 
-The operation preserves message content, thread IDs, titles, timestamps, pinned/section placement, and archive state. It covers active and archived JSONL rollouts, SQLite thread provider IDs, persisted thread settings, and history-cache byte offsets.
+The operation preserves message content, thread IDs, titles, timestamps, and pinned/section placement. It covers unarchived JSONL rollouts, SQLite thread provider IDs, persisted thread settings, and history-cache byte offsets. Archives are excluded.
 
 ## Usage
 
@@ -37,8 +39,8 @@ The app resolves `CODEX_HOME` (default: `%USERPROFILE%/.codex`) and the configur
 It updates:
 
 - Authentication and managed model-routing settings in `config.toml` and `auth.json`.
-- Provider fields in local `sessions` and `archived_sessions` JSONL files, including persisted thread settings.
-- `threads.model_provider` in `state_5.sqlite`.
+- Provider fields in unarchived local `sessions` JSONL files, including persisted thread settings.
+- `threads.model_provider` for unarchived threads in `state_5.sqlite`.
 - Read offsets in `thread_history_1.sqlite` when edited JSONL metadata changes byte lengths.
 
 Message records are preserved byte-for-byte. History-cache messages/turns, `session_index.jsonl`, and desktop global/sidebar state are not rewritten. TOML changes preserve unrelated settings, multiline instructions, comments, and custom provider headers.
@@ -52,7 +54,7 @@ ChatGPT snapshots and API keys stored in profiles use Windows DPAPI for the curr
 - Windows 10/11 x64; file-based Codex authentication (`cli_auth_credentials_store = "file"` or the current file default).
 - OpenAI-compatible Responses endpoints. Custom profiles use the saved API key via `auth.json`.
 - Current `state_5.sqlite` and JSONL rollouts. Unrecognized database versions, compressed rollouts, linked rollout paths, invalid files, and locked databases produce an error instead of a partial switch.
-- All local conversations in the selected Codex home follow the selected provider. This is not per-thread provider isolation.
+- Unarchived local conversations in the selected Codex home follow the selected provider. Archived conversations keep their original route. This is not per-thread provider isolation.
 - Config-profile or managed-policy overrides must agree with the selected route. Cloud-only chats and remote-host state are outside this local switcher's scope.
 - The selected backend must support the conversation's model/tools. Expired account credentials may require normal sign-in. Continuity does not grant models or capabilities unavailable on the selected backend.
 
@@ -65,7 +67,7 @@ dotnet test .\CodexAuthSwitcher.sln -c Release
 powershell -NoProfile -ExecutionPolicy Bypass -File .\publish.ps1 -Configuration Release
 ```
 
-Outputs: `artifacts/publish/win-x64/CodexAuthSwitcher.exe` and `artifacts/installer/CodexAuthSwitcher-Setup-1.2.0.exe`.
+Outputs: `artifacts/publish/win-x64/CodexAuthSwitcher.exe` and `artifacts/installer/CodexAuthSwitcher-Setup-1.2.1.exe`.
 
 The regression suite uses real SQLite databases and JSONL histories to test provider round-trips, message preservation, archive/sidebar metadata, WAL backups, rollback, quoted provider names, and Windows canonical paths.
 
@@ -90,11 +92,12 @@ Codex Auth Switcher 是 Windows 上的 Codex 账号/API 切换工具，核心功
 
 [下载最新版安装包或便携版](https://github.com/letdanceintherain/Codex-Auth-Switcher/releases/latest)。
 
-### v1.2.0 修复了什么
+### v1.2.1 修复了什么
 
+- 默认跳过归档目录，解决多个归档文件共用会话 ID 导致切换失败的问题。归档文件、数据库记录和缓存位置保持不变，不删除或合并历史。
 - 填写的模型商名称会直接生效，不再被旧版兼容选项强制改成 `openai`。
 - 切换时自动同步已有对话保存的模型商标记，解决切换后历史列表缺失、继续对话仍使用旧模型商的问题。
-- 支持已有和归档的本地对话，保留正文、对话 ID、标题、时间、置顶、分组与归档状态。
+- 同步未归档的本地对话，保留正文、对话 ID、标题、时间、置顶和分组；不再同步归档对话。
 - 同步前备份；写入失败时回滚。处理了 Windows 特殊路径、聊天缓存读取位置和旧版配置迁移。
 - 模型商名称支持中文、空格、点号；保留其他 Codex 配置和多行指令。
 
@@ -115,6 +118,6 @@ Codex Auth Switcher 是 Windows 上的 Codex 账号/API 切换工具，核心功
 
 如果电脑或程序在切换途中退出，程序会检测未完成的 `continuity-journal.json` 并阻止后续切换。请在关闭 Codex 后按该文件中的映射恢复备份；不要直接删除日志绕过恢复。
 
-当前支持 Windows x64、file 认证存储、Responses 接口、`state_5.sqlite` 和 JSONL 历史。未知数据库版本、压缩历史、路径链接、文件损坏或锁定会阻止切换。选中目录内的所有本地对话会跟随当前模型商，云端或远程主机对话不在同步范围内。
+当前支持 Windows x64、file 认证存储、Responses 接口、`state_5.sqlite` 和 JSONL 历史。未知数据库版本、未归档的压缩历史、路径链接、文件损坏或锁定会阻止切换。未归档的本地对话会跟随当前模型商；归档、云端或远程主机对话不在同步范围内。以后需要继续归档对话时，先在 Codex 中取消归档，再切换一次即可同步。
 
 模型商本身仍需要支持对话使用的模型和工具；过期账号可能需要重新登录。构建与隔离测试方法见上方英文说明。

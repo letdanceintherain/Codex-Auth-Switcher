@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.1 - 2026-09-14
+
+- Skip archived_sessions entirely so duplicate archived session IDs no longer block switching.
+- Exclude archived thread rows, referenced archive paths, and their history-cache offsets from synchronization, including inconsistent archive flags/paths and stray copies.
+- Preserve archived files without deleting, deduplicating, or rewriting them. Unarchive a conversation and switch again to synchronize it later.
+- Keep duplicate-ID protection for active histories and add archive-exclusion regressions.
+
 ## 1.2.0 - 2026-09-14
 
 - Honor the entered API provider ID even for profiles saved with the old compatibility flag.

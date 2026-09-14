@@ -69,31 +69,27 @@ internal static class ThreadContinuityService
             var state = OpenDatabase(statePath, backupDirectory, databases);
             var history = OpenDatabase(historyPath, backupDirectory, databases);
             var rollouts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var folder in new[] { "sessions", "archived_sessions" })
-            {
-                var root = System.IO.Path.Combine(codexHome, folder);
-                if (!Directory.Exists(root)) continue;
-                foreach (var path in Directory.EnumerateFiles(root, "*", new EnumerationOptions
-                {
-                    RecurseSubdirectories = true,
-                    IgnoreInaccessible = false,
-                    AttributesToSkip = FileAttributes.ReparsePoint
-                }))
-                {
-                    if (path.EndsWith(".jsonl.zst", StringComparison.OrdinalIgnoreCase))
-                        throw new IOException("Compressed Codex rollouts are not supported by this switcher version. No switch was applied.");
-                    if (path.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase)) rollouts.Add(path);
-                }
-            }
-
+            var archivedIds = new HashSet<string>(StringComparer.Ordinal);
+            var archivedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var activeIds = new List<string>();
             if (state is not null)
             {
-                using var query = Command(state, "SELECT id, rollout_path FROM threads");
+                using var query = Command(state, "SELECT id, rollout_path, archived FROM threads");
                 using var reader = query.ExecuteReader();
                 while (reader.Read())
                 {
-                    var path = NormalizePath(reader.GetString(1), codexHome);
-                    if (!File.Exists(path)) continue; // Keep metadata-only/missing-rollout threads.
+                    var id = reader.GetString(0);
+                    var path = reader.IsDBNull(1) ? null : NormalizePath(reader.GetString(1), codexHome);
+                    // Either the archive flag or archive directory is sufficient.
+                    // Some older records can disagree after moves/restores.
+                    if (reader.GetInt64(2) != 0 || (path is not null && IsArchivedPath(codexHome, path)))
+                    {
+                        archivedIds.Add(id);
+                        if (path is not null) archivedPaths.Add(path);
+                        continue;
+                    }
+                    activeIds.Add(id);
+                    if (path is null || !File.Exists(path)) continue;
                     EnsureLocalRollout(codexHome, path);
                     if (!path.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase))
                         throw new IOException($"Unsupported rollout format: {path}. No switch was applied.");
@@ -101,13 +97,31 @@ internal static class ThreadContinuityService
                 }
             }
 
+            var sessionsRoot = System.IO.Path.Combine(codexHome, "sessions");
+            if (Directory.Exists(sessionsRoot))
+            {
+                foreach (var path in Directory.EnumerateFiles(sessionsRoot, "*", new EnumerationOptions
+                {
+                    RecurseSubdirectories = true,
+                    IgnoreInaccessible = false,
+                    AttributesToSkip = FileAttributes.ReparsePoint
+                }))
+                {
+                    if (archivedPaths.Contains(path)) continue;
+                    if (path.EndsWith(".jsonl.zst", StringComparison.OrdinalIgnoreCase))
+                        throw new IOException("Compressed Codex rollouts are not supported by this switcher version. No switch was applied.");
+                    if (path.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase)) rollouts.Add(path);
+                }
+            }
+
+            rollouts.ExceptWith(archivedPaths);
             foreach (var path in rollouts.Order(StringComparer.OrdinalIgnoreCase))
             {
                 EnsureLocalRollout(codexHome, path);
                 var staged = path + "." + Guid.NewGuid().ToString("N") + ".switchtmp";
                 try
                 {
-                    var change = StageRollout(path, staged, provider);
+                    var change = StageRollout(path, staged, provider, archivedIds);
                     if (change is null) continue;
                     var fileBackup = System.IO.Path.Combine(backupDirectory, $"rollout-{files.Count}.jsonl");
                     File.Copy(path, fileBackup);
@@ -124,9 +138,14 @@ internal static class ThreadContinuityService
 
             if (state is not null)
             {
-                using var update = Command(state, "UPDATE threads SET model_provider = $provider WHERE model_provider IS NOT $provider");
+                using var update = Command(state, "UPDATE threads SET model_provider = $provider WHERE id = $id AND archived = 0 AND model_provider IS NOT $provider");
                 update.Parameters.AddWithValue("$provider", provider);
-                changedThreads = update.ExecuteNonQuery();
+                var idParameter = update.Parameters.Add("$id", SqliteType.Text);
+                foreach (var id in activeIds)
+                {
+                    idParameter.Value = id;
+                    changedThreads += update.ExecuteNonQuery();
+                }
             }
             // A changed JSONL line can change byte offsets used by the materialized
             // history cache. Preserve items/turns and shift only the read cursor.
@@ -292,8 +311,7 @@ internal static class ThreadContinuityService
     private static void EnsureLocalRollout(string codexHome, string path)
     {
         var relative = System.IO.Path.GetRelativePath(codexHome, path);
-        if (!(relative.StartsWith("sessions" + System.IO.Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
-            || relative.StartsWith("archived_sessions" + System.IO.Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)))
+        if (!relative.StartsWith("sessions" + System.IO.Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
             throw new IOException($"Rollout is outside the local session library: {path}");
         for (var current = path; !string.Equals(current, codexHome, StringComparison.OrdinalIgnoreCase); current = System.IO.Path.GetDirectoryName(current)!)
         {
@@ -302,7 +320,11 @@ internal static class ThreadContinuityService
         }
     }
 
-    private static RolloutChange? StageRollout(string path, string staged, string provider)
+    private static bool IsArchivedPath(string codexHome, string path) =>
+        System.IO.Path.GetRelativePath(codexHome, path).StartsWith(
+            "archived_sessions" + System.IO.Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+
+    private static RolloutChange? StageRollout(string path, string staged, string provider, HashSet<string> archivedIds)
     {
         using var input = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read);
         using var output = File.Create(staged);
@@ -323,6 +345,8 @@ internal static class ThreadContinuityService
             if (type == "session_meta")
             {
                 id ??= root.GetProperty("payload").GetProperty("id").GetString();
+                // Do not associate a stray copy with an archived thread's cache.
+                if (id is not null && archivedIds.Contains(id)) return null;
                 field = "model_provider";
             }
             else if (type == "event_msg"
