@@ -329,7 +329,9 @@ public sealed class MainWindowViewModel : ViewModelBase
             return;
         }
 
-        if (IsCodexRunning)
+        var processState = _desktopProcessService.GetDesktopAppState();
+        _desktopAppPath = processState.DesktopAppPath ?? _desktopAppPath;
+        if (processState.IsRunning)
         {
             var decision = _dialogService.PromptRunningCodex();
             if (decision == RunningCodexDecision.Cancel)
@@ -386,11 +388,11 @@ public sealed class MainWindowViewModel : ViewModelBase
         await RefreshAsync();
         if (result.RestartMethod == RestartMethod.None)
         {
-            SetStatus("Status.SwitchedRestartFailed", result.SwitchResult.AppliedProfileName);
+            SetStatus("Status.SwitchedRestartFailed", result.SwitchResult.AppliedProfileName, result.SwitchResult.SynchronizedThreads);
         }
         else
         {
-            SetStatus("Status.SwitchedRestarted", result.SwitchResult.AppliedProfileName, result.RestartMethod);
+            SetStatus("Status.SwitchedRestarted", result.SwitchResult.AppliedProfileName, result.RestartMethod, result.SwitchResult.SynchronizedThreads);
         }
     }
 

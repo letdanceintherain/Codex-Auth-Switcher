@@ -109,9 +109,9 @@ public sealed class LiveAuthInspector
 
     private LiveAuthIdentity? InspectApi(string configText, string apiKey)
     {
-        var provider = TomlOverlayService.TryReadScalar(configText, "model_provider") ?? "(default)";
+        var provider = TomlOverlayService.TryReadScalar(configText, "model_provider") ?? "openai";
         var model = TomlOverlayService.TryReadScalar(configText, "model") ?? "(default)";
-        var baseUrl = TomlOverlayService.TryReadSectionScalar(configText, $"model_providers.{provider}", "base_url")
+        var baseUrl = TomlOverlayService.TryReadSectionScalar(configText, TomlOverlayService.ProviderSection(provider), "base_url")
             ?? (string.Equals(provider, "openai", StringComparison.OrdinalIgnoreCase)
                 ? TomlOverlayService.TryReadScalar(configText, "openai_base_url")
                     ?? _runtimeEnvironment.GetOpenAiBaseUrl()

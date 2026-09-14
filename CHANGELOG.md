@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.2.0 - 2026-09-14
+
+- Honor the entered API provider ID even for profiles saved with the old compatibility flag.
+- Synchronize local thread provider metadata on every switch so existing and archived conversations remain visible and resumable across providers.
+- Update JSONL session metadata, persisted thread settings, SQLite thread provider IDs, and history projection byte offsets together; preserve messages, IDs, timestamps, sidebar placement, and archive state.
+- Back up changed JSONL files and SQLite databases (including WAL data), roll back failed writes, and record a recovery journal for interrupted switches.
+- Restore ChatGPT accounts to the built-in OpenAI route even when captured with stale API settings.
+- Parse TOML syntax to support quoted/Unicode provider names and preserve multiline instructions, comments, and provider-specific headers.
+- Recognize legacy API fingerprints and Windows verbatim rollout paths.
+- Recheck running Codex processes before applying changes and remove the misleading provider-forcing checkbox.
+- Add realistic SQLite/JSONL regressions and an isolated smoke check using the real Codex app server.
+
 ## 1.1.0 - 2026-07-29
 
 - Preserve the local thread library by restoring only authentication and managed model-routing keys.

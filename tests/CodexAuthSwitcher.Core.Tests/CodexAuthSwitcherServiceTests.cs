@@ -49,8 +49,9 @@ public sealed class CodexAuthSwitcherServiceTests : IDisposable
 
         Assert.True(switchResult.RestartRequired);
         var apiConfig = File.ReadAllText(Path.Combine(CodexHome, "config.toml"));
-        Assert.Contains("model_provider = \"openai\"", apiConfig);
-        Assert.Contains("openai_base_url = \"https://api.funai.vip\"", apiConfig);
+        Assert.Contains("model_provider = \"crs\"", apiConfig);
+        Assert.Contains("[model_providers.crs]", apiConfig);
+        Assert.Contains("base_url = \"https://api.funai.vip\"", apiConfig);
         Assert.DoesNotContain("preferred_auth_method", apiConfig);
         Assert.DoesNotContain("disable_response_storage", apiConfig);
         Assert.Contains("[mcp_servers.original]", apiConfig);
@@ -136,7 +137,7 @@ public sealed class CodexAuthSwitcherServiceTests : IDisposable
         Assert.Equal("funai", sync.MatchedProfileName);
         Assert.NotNull(environment.CurrentProfile);
         Assert.Equal("funai", environment.CurrentProfile!.ProfileName);
-        Assert.Equal("openai", environment.ModelProvider);
+        Assert.Equal("crs", environment.ModelProvider);
         Assert.Equal("api.funai.vip", environment.LiveIdentity?.ApiHost);
     }
 
@@ -199,7 +200,7 @@ public sealed class CodexAuthSwitcherServiceTests : IDisposable
     public void SwitchProfile_CanCreateMissingAuthFileInFileMode()
     {
         Directory.CreateDirectory(CodexHome);
-        File.WriteAllText(Path.Combine(CodexHome, "config.toml"), "model = \"gpt-5.4\"" + Environment.NewLine);
+        File.WriteAllText(Path.Combine(CodexHome, "config.toml"), "sqlite_home = '.'\nmodel = \"gpt-5.4\"" + Environment.NewLine);
         var service = CreateService();
         service.SaveApiProfile(CreateApiProfile());
 
@@ -257,7 +258,7 @@ public sealed class CodexAuthSwitcherServiceTests : IDisposable
     private void WriteLiveFiles(string configText, string authText)
     {
         Directory.CreateDirectory(CodexHome);
-        File.WriteAllText(Path.Combine(CodexHome, "config.toml"), configText);
+        File.WriteAllText(Path.Combine(CodexHome, "config.toml"), "sqlite_home = '.'\n" + configText);
         File.WriteAllText(Path.Combine(CodexHome, "auth.json"), authText);
     }
 
@@ -265,11 +266,9 @@ public sealed class CodexAuthSwitcherServiceTests : IDisposable
     {
         var files = new Dictionary<string, byte[]>
         {
-            ["sessions/thread.jsonl"] = "thread-data"u8.ToArray(),
-            ["archived_sessions/archived.jsonl"] = "archived-data"u8.ToArray(),
             ["session_index.jsonl"] = "index-data"u8.ToArray(),
-            ["state_5.sqlite"] = [0, 1, 2, 3, 4],
-            ["thread_history_1.sqlite"] = [5, 6, 7, 8]
+            [".codex-global-state.json"] = "{\"sidebar\":\"preserved\"}"u8.ToArray(),
+            ["history.jsonl"] = "history-data"u8.ToArray()
         };
 
         foreach (var (relativePath, content) in files)

@@ -15,12 +15,9 @@ public sealed class ApiProfileSpec
 
     public string GetEffectiveProviderId()
     {
-        if (UseOpenAiThreadView)
-        {
-            return "openai";
-        }
-
-        return string.IsNullOrWhiteSpace(Provider) ? "crs" : Provider.Trim();
+        // The legacy compatibility flag must never replace the user's provider.
+        var provider = GetDisplayProvider();
+        return string.Equals(provider, "openai", StringComparison.OrdinalIgnoreCase) ? "openai" : provider;
     }
 
     public string GetDisplayProvider()

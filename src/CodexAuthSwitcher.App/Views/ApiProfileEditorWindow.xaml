@@ -84,13 +84,9 @@
                         <TextBlock Text="{Binding Source={x:Static app:App.Localization}, Path=[Dialog.ApiEditor.WireApi]}" />
                         <TextBox Text="{Binding Profile.WireApi, UpdateSourceTrigger=PropertyChanged}" />
 
-                        <TextBlock Text="{Binding Source={x:Static app:App.Localization}, Path=[Dialog.ApiEditor.RequiresOpenAiAuth]}" />
-                        <CheckBox IsChecked="{Binding Profile.RequiresOpenAiAuth}"
-                                  Content="{Binding Source={x:Static app:App.Localization}, Path=[Dialog.ApiEditor.RequiresOpenAiAuth.Checkbox]}" />
-
                         <TextBlock Text="{Binding Source={x:Static app:App.Localization}, Path=[Dialog.ApiEditor.UseOpenAiThreadView]}" />
-                        <CheckBox IsChecked="{Binding Profile.UseOpenAiThreadView}"
-                                  Content="{Binding Source={x:Static app:App.Localization}, Path=[Dialog.ApiEditor.UseOpenAiThreadView.Checkbox]}" />
+                        <TextBlock TextWrapping="Wrap" Margin="0,4,0,12"
+                                   Text="{Binding Source={x:Static app:App.Localization}, Path=[Dialog.ApiEditor.UseOpenAiThreadView.Checkbox]}" />
 
                         <TextBlock Text="{Binding Source={x:Static app:App.Localization}, Path=[Dialog.ApiEditor.TokenLimit]}" />
                         <TextBox Text="{Binding Profile.ModelAutoCompactTokenLimit, UpdateSourceTrigger=PropertyChanged}" />

@@ -373,6 +373,17 @@ public sealed class ProfileStore
             }
 
             apiHost ??= TryGetHost(metadata.BaseUrl);
+            // v1.1 fingerprints used the forced "openai" ID. Derive identity from
+            // the actual saved provider so old profiles still match after switching.
+            if (!string.IsNullOrWhiteSpace(apiKey))
+            {
+                identityFingerprint = _liveAuthInspector.CreateApiIdentity(new ApiProfileSpec
+                {
+                    Provider = metadata.Provider ?? metadata.ModelProvider ?? "crs",
+                    BaseUrl = metadata.BaseUrl ?? string.Empty,
+                    ApiKey = apiKey
+                }).IdentityFingerprint;
+            }
         }
         else
         {

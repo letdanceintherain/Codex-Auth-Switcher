@@ -20,7 +20,9 @@ public sealed class TomlOverlayServiceTests
             sandbox = "elevated"
             """;
 
-        var output = TomlOverlayService.ApplyApiOverlay(input, CreateSpec());
+        var spec = CreateSpec();
+        spec.Provider = "openai";
+        var output = TomlOverlayService.ApplyApiOverlay(input, spec);
 
         Assert.Contains("model_provider = \"openai\"", output);
         Assert.Contains("openai_base_url = \"https://api.funai.vip\"", output);
@@ -33,8 +35,10 @@ public sealed class TomlOverlayServiceTests
         TomlOverlayService.Validate(output);
     }
 
-    [Fact]
-    public void ApplyApiOverlay_UsesCustomProviderWhenCompatibilityModeIsDisabled()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void ApplyApiOverlay_UsesEnteredProviderRegardlessOfLegacyFlag(bool legacyFlag)
     {
         var input = """
             model = "gpt-old"
@@ -44,7 +48,7 @@ public sealed class TomlOverlayServiceTests
             url = "https://example.test/mcp"
             """;
         var spec = CreateSpec();
-        spec.UseOpenAiThreadView = false;
+        spec.UseOpenAiThreadView = legacyFlag;
 
         var output = TomlOverlayService.ApplyApiOverlay(input, spec);
 
@@ -119,6 +123,45 @@ public sealed class TomlOverlayServiceTests
         Assert.Contains("model = \"gpt-5.4\"", overlay);
         Assert.DoesNotContain("mcp_servers", overlay);
         Assert.DoesNotContain("private.example", overlay);
+    }
+
+    [Theory]
+    [InlineData("my.provider")]
+    [InlineData("模型商 A")]
+    [InlineData("provider-$1")]
+    public void ProviderName_WithQuotedKeys_RoundTrips(string provider)
+    {
+        var spec = CreateSpec();
+        spec.Provider = provider;
+        var output = TomlOverlayService.ApplyApiOverlay("", spec);
+        Assert.Equal(provider, TomlOverlayService.TryReadScalar(output, "model_provider"));
+        Assert.Equal(provider, TomlOverlayService.TryReadSectionScalar(output, TomlOverlayService.ProviderSection(provider), "name"));
+        Assert.Equal(output, TomlOverlayService.ApplyApiOverlay(output, spec));
+    }
+
+    [Fact]
+    public void MultilineInstructionsAndQuotedProviderTable_ArePreserved()
+    {
+        var input = "\"\"\"";
+        var instructions = "developer_instructions = " + input + "\n[not_a_table]\nmodel = 'do not change'\n\n\n" + input + "\n";
+        var config = instructions + """
+            "model_provider" = 'crs' # selected
+            [model_providers."crs"] # keep comment
+            base_url = 'http://old.invalid'
+            request_max_retries = 3
+            env_key = 'OLD_KEY'
+            [model_providers.crs.http_headers]
+            keep = "header"
+            [model_providers.crs.auth]
+            command = "old-token-command"
+            """;
+        var output = TomlOverlayService.ApplyApiOverlay(config, CreateSpec());
+        Assert.Contains(instructions, output);
+        Assert.Contains("request_max_retries = 3", output);
+        Assert.Contains("keep = \"header\"", output);
+        Assert.DoesNotContain("OLD_KEY", output);
+        Assert.DoesNotContain("old-token-command", output);
+        Assert.Equal("crs", TomlOverlayService.TryReadScalar(output, "model_provider"));
     }
 
     private static ApiProfileSpec CreateSpec()

@@ -8,6 +8,14 @@ public sealed class CodexDesktopProcessService
     private const string AppId = "OpenAI.Codex_2p2nqsd0c76g0!App";
     private static readonly string[] DesktopProcessNames = ["ChatGPT", "Codex"];
 
+    public static bool HasRunningCodex()
+    {
+        if (new CodexDesktopProcessService().GetDesktopAppState().IsRunning) return true;
+        var processes = Process.GetProcessesByName("codex");
+        try { return processes.Any(process => !process.HasExited); }
+        finally { foreach (var process in processes) process.Dispose(); }
+    }
+
     public DesktopAppState GetDesktopAppState()
     {
         var processes = GetDesktopProcesses();

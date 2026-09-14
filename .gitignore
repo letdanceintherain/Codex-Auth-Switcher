@@ -4,6 +4,9 @@ src/**/bin/
 src/**/obj/
 tests/**/bin/
 tests/**/obj/
+tools/**/bin/
+tools/**/obj/
+tools/**/__pycache__/
 
 # IDE and local tooling
 .vs/

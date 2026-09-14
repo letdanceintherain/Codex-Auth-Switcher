@@ -9,9 +9,11 @@ public sealed class CodexAuthSwitcherService
     private readonly ProfileStore _profileStore;
     private readonly LiveAuthInspector _liveAuthInspector;
     private readonly ICodexRuntimeEnvironmentService _runtimeEnvironment;
+    private readonly Func<bool> _hasRunningCodex;
 
     public CodexAuthSwitcherService(string codexHomePath)
     {
+        _hasRunningCodex = CodexDesktopProcessService.HasRunningCodex;
         _runtimeEnvironment = new CodexRuntimeEnvironmentService();
         _liveAuthInspector = new LiveAuthInspector(_runtimeEnvironment);
         _profileStore = new ProfileStore(codexHomePath, new ProtectedSecretStore(), _liveAuthInspector);
@@ -22,8 +24,10 @@ public sealed class CodexAuthSwitcherService
     public CodexAuthSwitcherService(
         ProfileStore profileStore,
         LiveAuthInspector liveAuthInspector,
-        ICodexRuntimeEnvironmentService? runtimeEnvironment = null)
+        ICodexRuntimeEnvironmentService? runtimeEnvironment = null,
+        Func<bool>? hasRunningCodex = null)
     {
+        _hasRunningCodex = hasRunningCodex ?? (() => false);
         _profileStore = profileStore;
         _liveAuthInspector = liveAuthInspector;
         _runtimeEnvironment = runtimeEnvironment ?? new CodexRuntimeEnvironmentService();
@@ -46,7 +50,7 @@ public sealed class CodexAuthSwitcherService
             ConfigPath = ConfigPath,
             AuthPath = AuthPath,
             CurrentAuthMode = liveIdentity?.AuthMode ?? ReadCurrentAuthMode(authText),
-            ModelProvider = TomlOverlayService.TryReadScalar(configText, "model_provider") ?? "(default)",
+            ModelProvider = TomlOverlayService.TryReadScalar(configText, "model_provider") ?? "openai",
             Model = TomlOverlayService.TryReadScalar(configText, "model") ?? "(default)",
             LiveIdentity = liveIdentity,
             CurrentProfile = _profileStore.ReadCurrentProfileState()
@@ -181,6 +185,12 @@ public sealed class CodexAuthSwitcherService
             throw new InvalidOperationException("API key is required.");
         }
 
+        if (spec.GetEffectiveProviderId() is "ollama" or "lmstudio")
+            throw new InvalidOperationException("This provider ID is reserved by Codex. Choose a custom provider name.");
+        if (spec.WireApi != "responses")
+            throw new InvalidOperationException("Codex API profiles require the responses wire API.");
+        spec.RequiresOpenAiAuth = true;
+        TomlOverlayService.Validate(TomlOverlayService.ApplyApiOverlay(string.Empty, spec));
         _profileStore.SaveApiProfile(spec);
     }
 
@@ -195,12 +205,21 @@ public sealed class CodexAuthSwitcherService
 
     public SwitchResult SwitchProfile(string profileName)
     {
+        if (_hasRunningCodex())
+            throw new InvalidOperationException("Close Codex Desktop and Codex CLI tasks before switching accounts or synchronizing conversation routing.");
         EnsureConfigExists();
+        _profileStore.EnsureLayout();
+        using var switchLock = File.Open(Path.Combine(_profileStore.RootPath, "switch.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+        ThreadContinuityService.EnsureNoInterruptedSwitch(_profileStore.BackupsPath);
         var currentConfigText = File.ReadAllText(ConfigPath);
         EnsureFileCredentialStore(currentConfigText);
         var (configText, authText, kind) = _profileStore.LoadProfileFilesForSwitch(profileName, currentConfigText);
         var backupPath = _profileStore.BackupLiveFiles(ConfigPath, AuthPath);
-        TextFileService.WriteConfigAndAuthTransactional(ConfigPath, configText, AuthPath, authText);
+        var synchronizedThreads = ThreadContinuityService.Switch(_profileStore.CodexHomePath, configText, authText, backupPath, () =>
+        {
+            if (_hasRunningCodex())
+                throw new InvalidOperationException("Codex started while preparing the switch. Close it and try again.");
+        });
         _runtimeEnvironment.ApplyForProfile(kind == ProfileKind.ApiKey ? _profileStore.LoadApiProfile(profileName) : null);
 
         try
@@ -226,6 +245,7 @@ public sealed class CodexAuthSwitcherService
             AppliedProfileName = profileName,
             ProfileKind = kind,
             BackupPath = backupPath,
+            SynchronizedThreads = synchronizedThreads,
             RestartRequired = true
         };
     }
