@@ -31,18 +31,118 @@ internal static class ThreadContinuityService
         }
     }
 
-    public static void EnsureNoInterruptedSwitch(string backupsPath)
+    public static bool NeedsSynchronization(string codexHome, string currentConfig, string targetConfig)
     {
-        if (!Directory.Exists(backupsPath)) return;
-        foreach (var path in Directory.EnumerateFiles(backupsPath, "continuity-journal.json", SearchOption.AllDirectories))
+        codexHome = NormalizePath(codexHome, Environment.CurrentDirectory);
+        var sqliteHome = ResolveSqliteHome(codexHome, targetConfig);
+        ValidateDatabaseVersion(sqliteHome);
+        var statePath = System.IO.Path.Combine(sqliteHome, "state_5.sqlite");
+        var provider = TomlOverlayService.TryReadScalar(targetConfig, "model_provider") ?? "openai";
+        if (!File.Exists(statePath))
         {
-            using var document = JsonDocument.Parse(File.ReadAllText(path));
-            if (document.RootElement.GetProperty("status").GetString() is "applying" or "recovery-required")
-                throw new IOException($"An interrupted switch needs recovery before continuing. Restore the files listed in {path} with Codex closed.");
+            if (File.Exists(System.IO.Path.Combine(sqliteHome, "thread_history_1.sqlite")))
+                throw new IOException("The Codex history cache exists without its state database. No switch was applied.");
+            // Legacy homes have no index to query. Scan them only on a provider change.
+            return Directory.Exists(System.IO.Path.Combine(codexHome, "sessions"))
+                && (TomlOverlayService.TryReadScalar(currentConfig, "model_provider") ?? "openai") != provider;
         }
+        using var state = OpenConnection(statePath, SqliteOpenMode.ReadOnly);
+        using var query = state.CreateCommand();
+        query.CommandText = "SELECT rollout_path FROM threads WHERE archived = 0 AND model_provider IS NOT $provider";
+        query.Parameters.AddWithValue("$provider", provider);
+        using var reader = query.ExecuteReader();
+        while (reader.Read())
+            if (reader.IsDBNull(0) || !IsArchivedPath(codexHome, NormalizePath(reader.GetString(0), codexHome))) return true;
+        return false;
     }
 
-    public static int Switch(string codexHome, string configText, string authText, string backupPath, Action? beforeApply = null)
+    private static void ValidateDatabaseVersion(string sqliteHome)
+    {
+        if (Directory.Exists(sqliteHome) && Directory.EnumerateFiles(sqliteHome, "state_*.sqlite")
+            .Any(path => !string.Equals(System.IO.Path.GetFileName(path), "state_5.sqlite", StringComparison.OrdinalIgnoreCase)))
+            throw new IOException("Unsupported Codex state database version. No switch was applied.");
+    }
+
+    public static string? RecoverInterruptedSwitch(string codexHome, string backupPath, Action beforeRestore)
+    {
+        var journalPath = System.IO.Path.Combine(backupPath, "continuity-journal.json");
+        if (!File.Exists(journalPath)) return null; // Preparation never changed live files.
+        var journal = JsonNode.Parse(File.ReadAllText(journalPath))!;
+        var status = journal["status"]!.GetValue<string>();
+        if (status is "complete" or "rolled-back") return status;
+        if (status is not ("applying" or "recovery-required"))
+            throw new IOException($"Unknown switch recovery status: {journalPath}");
+
+        codexHome = NormalizePath(codexHome, Environment.CurrentDirectory);
+        backupPath = NormalizePath(backupPath, Environment.CurrentDirectory);
+        var configPath = System.IO.Path.Combine(codexHome, "config.toml");
+        var files = journal["files"]!.AsArray().Select(node => (
+            Target: NormalizePath(node!["target"]!.GetValue<string>(), codexHome),
+            Backup: NormalizePath(node["backup"]!.GetValue<string>(), backupPath),
+            Existed: node["existed"]!.GetValue<bool>())).ToList();
+        var databases = journal["databases"]!.AsArray().Select(node => (
+            Target: NormalizePath(node!["target"]!.GetValue<string>(), codexHome),
+            Backup: NormalizePath(node["backup"]!.GetValue<string>(), backupPath))).ToList();
+        var configBackup = files.FirstOrDefault(file => string.Equals(file.Target, configPath, StringComparison.OrdinalIgnoreCase));
+        var config = File.ReadAllText(configBackup.Existed ? configBackup.Backup : configPath);
+        var sqliteHome = ResolveSqliteHome(codexHome, config);
+
+        // Validate every source and target before restoring any of them. New
+        // paginated generations can be deleted, but existing histories cannot.
+        foreach (var file in files)
+        {
+            var isConfig = string.Equals(file.Target, configPath, StringComparison.OrdinalIgnoreCase);
+            var isAuth = string.Equals(file.Target, System.IO.Path.Combine(codexHome, "auth.json"), StringComparison.OrdinalIgnoreCase);
+            if (!isConfig && !isAuth)
+            {
+                var relative = System.IO.Path.GetRelativePath(codexHome, file.Target);
+                if (!relative.StartsWith("sessions" + System.IO.Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+                    || !file.Target.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase))
+                    throw new IOException("Recovery target is outside the active conversation library.");
+                if (File.Exists(file.Target)) EnsureLocalRollout(codexHome, file.Target);
+            }
+            if (!file.Existed) continue;
+            ValidateRecoverySource(file.Backup, backupPath);
+            if (isConfig) TomlOverlayService.Validate(File.ReadAllText(file.Backup));
+            if (isAuth) using (JsonDocument.Parse(File.ReadAllText(file.Backup))) { }
+        }
+        foreach (var database in databases)
+        {
+            if (!new[] { "state_5.sqlite", "thread_history_1.sqlite" }.Any(name =>
+                    string.Equals(database.Target, System.IO.Path.Combine(sqliteHome, name), StringComparison.OrdinalIgnoreCase)))
+                throw new IOException("Recovery database does not match the configured Codex database directory.");
+            ValidateRecoverySource(database.Backup, backupPath);
+            using var source = OpenConnection(database.Backup, SqliteOpenMode.ReadOnly);
+        }
+        beforeRestore();
+        foreach (var database in databases)
+        {
+            using var source = OpenConnection(database.Backup, SqliteOpenMode.ReadOnly);
+            using var target = OpenConnection(database.Target, SqliteOpenMode.ReadWriteCreate);
+            source.BackupDatabase(target);
+        }
+        foreach (var file in files.AsEnumerable().Reverse())
+        {
+            if (!file.Existed) { File.Delete(file.Target); continue; }
+            var staged = System.IO.Path.Combine(backupPath, "recover.switchtmp");
+            File.Copy(file.Backup, staged, overwrite: true);
+            File.Move(staged, file.Target, overwrite: true);
+        }
+        journal["status"] = "rolled-back";
+        TextFileService.WriteUtf8NoBom(journalPath, journal.ToJsonString());
+        return "rolled-back";
+    }
+
+    private static void ValidateRecoverySource(string path, string backupPath)
+    {
+        var relative = System.IO.Path.GetRelativePath(backupPath, path);
+        if (System.IO.Path.IsPathRooted(relative) || relative == ".."
+            || relative.StartsWith(".." + System.IO.Path.DirectorySeparatorChar) || !File.Exists(path))
+            throw new IOException($"The switch recovery source is missing or outside its recovery point: {path}");
+    }
+
+    public static int Switch(string codexHome, string configText, string authText, string backupPath,
+        Action? beforeApply = null, bool synchronizeThreads = true)
     {
         codexHome = NormalizePath(codexHome, Environment.CurrentDirectory);
         var provider = TomlOverlayService.TryReadScalar(configText, "model_provider") ?? "openai";
@@ -59,156 +159,165 @@ internal static class ThreadContinuityService
         var changedThreads = 0;
         try
         {
-            var statePath = System.IO.Path.Combine(sqliteHome, "state_5.sqlite");
-            var historyPath = System.IO.Path.Combine(sqliteHome, "thread_history_1.sqlite");
-            // Fail explicitly on unrecognized state versions instead of silently
-            // updating an inactive DB and reporting a successful seamless switch.
-            if (Directory.Exists(sqliteHome) && Directory.EnumerateFiles(sqliteHome, "state_*.sqlite")
-                .Any(path => !string.Equals(path, statePath, StringComparison.OrdinalIgnoreCase)))
-                throw new IOException("Unsupported Codex state database version. No switch was applied.");
-
-            if (!File.Exists(statePath) && File.Exists(historyPath))
-                throw new IOException("The Codex history cache exists without its state database. Its rollout ownership cannot be verified. No switch was applied.");
-
-            var state = OpenDatabase(statePath, backupDirectory, databases);
-            var history = OpenDatabase(historyPath, backupDirectory, databases);
-            // SQLite owns the identity/path association. A fork can retain its
-            // source session_meta ID, and the directory can contain old copies.
-            var rollouts = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
-            var archivedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var activeIds = new List<string>();
-            var replacementPaths = new Dictionary<string, string>(StringComparer.Ordinal);
-            if (state is not null)
+            if (synchronizeThreads)
             {
-                using var query = Command(state, "SELECT id, rollout_path, archived FROM threads");
-                using var reader = query.ExecuteReader();
-                while (reader.Read())
+                var statePath = System.IO.Path.Combine(sqliteHome, "state_5.sqlite");
+                var historyPath = System.IO.Path.Combine(sqliteHome, "thread_history_1.sqlite");
+                // Fail explicitly on unrecognized state versions instead of silently
+                // updating an inactive DB and reporting a successful seamless switch.
+                ValidateDatabaseVersion(sqliteHome);
+
+                if (!File.Exists(statePath) && File.Exists(historyPath))
+                    throw new IOException("The Codex history cache exists without its state database. Its rollout ownership cannot be verified. No switch was applied.");
+
+                var state = OpenDatabase(statePath, backupDirectory, databases);
+                // SQLite owns the identity/path association. A fork can retain its
+                // source session_meta ID, and the directory can contain old copies.
+                var rollouts = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+                var archivedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var activeIds = new List<string>();
+                var changedIds = new HashSet<string>(StringComparer.Ordinal);
+                var replacementPaths = new Dictionary<string, string>(StringComparer.Ordinal);
+                if (state is not null)
                 {
-                    var id = reader.GetString(0);
-                    var path = reader.IsDBNull(1) ? null : NormalizePath(reader.GetString(1), codexHome);
-                    // Either the archive flag or archive directory is sufficient.
-                    // Some older records can disagree after moves/restores.
-                    if (reader.GetInt64(2) != 0 || (path is not null && IsArchivedPath(codexHome, path)))
+                    using var query = Command(state, "SELECT id, rollout_path, archived, model_provider FROM threads");
+                    using var reader = query.ExecuteReader();
+                    while (reader.Read())
                     {
-                        if (path is not null) archivedPaths.Add(path);
-                        continue;
+                        var id = reader.GetString(0);
+                        var path = reader.IsDBNull(1) ? null : NormalizePath(reader.GetString(1), codexHome);
+                        // Either the archive flag or archive directory is sufficient.
+                        // Some older records can disagree after moves/restores.
+                        if (reader.GetInt64(2) != 0 || (path is not null && IsArchivedPath(codexHome, path)))
+                        {
+                            if (path is not null) archivedPaths.Add(path);
+                            continue;
+                        }
+                        if (reader.IsDBNull(3) || reader.GetString(3) != provider)
+                        {
+                            activeIds.Add(id);
+                            changedIds.Add(id);
+                        }
+                        if (path is null || !File.Exists(path)) continue;
+                        if (!rollouts.TryAdd(path, id))
+                            throw new IOException($"Multiple indexed threads reference the same rollout: {path}. No switch was applied.");
                     }
-                    activeIds.Add(id);
-                    if (path is null || !File.Exists(path)) continue;
+                }
+
+                var sessionsRoot = System.IO.Path.Combine(codexHome, "sessions");
+                // Only legacy homes without a state DB fall back to enumeration.
+                // Never mix indexed paths with unreferenced files/copies.
+                if (state is null && Directory.Exists(sessionsRoot))
+                {
+                    foreach (var path in Directory.EnumerateFiles(sessionsRoot, "*", new EnumerationOptions
+                    {
+                        RecurseSubdirectories = true,
+                        IgnoreInaccessible = false,
+                        AttributesToSkip = FileAttributes.ReparsePoint
+                    }))
+                    {
+                        if (path.EndsWith(".jsonl.zst", StringComparison.OrdinalIgnoreCase))
+                            throw new IOException("Compressed Codex rollouts are not supported by this switcher version. No switch was applied.");
+                        if (path.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase)) rollouts.Add(path, null);
+                    }
+                }
+
+                if (rollouts.Keys.Any(archivedPaths.Contains))
+                    throw new IOException("An active and an archived thread reference the same rollout. No switch was applied.");
+                var legacyRolloutIds = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var (path, canonicalId) in rollouts.OrderBy(item => item.Key, StringComparer.OrdinalIgnoreCase))
+                {
+                    if (canonicalId is not null && !changedIds.Contains(canonicalId)) continue;
                     EnsureLocalRollout(codexHome, path);
                     if (!path.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase))
                         throw new IOException($"Unsupported rollout format: {path}. No switch was applied.");
-                    if (!rollouts.TryAdd(path, id))
-                        throw new IOException($"Multiple indexed threads reference the same rollout: {path}. No switch was applied.");
-                }
-            }
-
-            var sessionsRoot = System.IO.Path.Combine(codexHome, "sessions");
-            // Only legacy homes without a state DB fall back to enumeration.
-            // Never mix indexed paths with unreferenced files/copies.
-            if (state is null && Directory.Exists(sessionsRoot))
-            {
-                foreach (var path in Directory.EnumerateFiles(sessionsRoot, "*", new EnumerationOptions
-                {
-                    RecurseSubdirectories = true,
-                    IgnoreInaccessible = false,
-                    AttributesToSkip = FileAttributes.ReparsePoint
-                }))
-                {
-                    if (path.EndsWith(".jsonl.zst", StringComparison.OrdinalIgnoreCase))
-                        throw new IOException("Compressed Codex rollouts are not supported by this switcher version. No switch was applied.");
-                    if (path.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase)) rollouts.Add(path, null);
-                }
-            }
-
-            if (rollouts.Keys.Any(archivedPaths.Contains))
-                throw new IOException("An active and an archived thread reference the same rollout. No switch was applied.");
-            var legacyRolloutIds = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var (path, canonicalId) in rollouts.OrderBy(item => item.Key, StringComparer.OrdinalIgnoreCase))
-            {
-                EnsureLocalRollout(codexHome, path);
-                var staged = path + "." + Guid.NewGuid().ToString("N") + ".switchtmp";
-                try
-                {
-                    var change = StageRollout(path, staged, provider, canonicalId);
-                    if (change is null) continue;
-                    // An unchanged duplicate is still ambiguous: never bind a
-                    // changed copy to a cache owned by another physical file.
-                    if (!legacyRolloutIds.Add(change.Id))
-                        throw new IOException($"Duplicate session identity in local rollouts: {change.Id}. No switch was applied.");
-                    if (change.Offsets.Count == 0) continue;
-                    if (change.IsPaginated)
+                    var staged = System.IO.Path.Combine(backupDirectory, Guid.NewGuid().ToString("N") + ".switchtmp");
+                    try
                     {
-                        // A new immutable rollout generation preserves every old
-                        // cache and history_base reference, including archives.
-                        var logicalId = Guid.Parse(canonicalId!).ToString();
-                        var timestamp = DateTime.Now.ToString("yyyy-MM-ddTHH-mm-ss", CultureInfo.InvariantCulture);
-                        var name = $"rollout-{timestamp}-{logicalId}_{Guid.NewGuid()}.jsonl";
-                        var replacement = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(path)!, name);
-                        if (File.Exists(replacement)) throw new IOException("The replacement rollout already exists.");
-                        files.Add(new FileChange(replacement, staged, path, false));
-                        replacementPaths.Add(canonicalId!, replacement);
-                        continue;
-                    }
-                    var fileBackup = System.IO.Path.Combine(backupDirectory, $"rollout-{files.Count}.jsonl");
-                    File.Copy(path, fileBackup);
-                    files.Add(new FileChange(path, staged, fileBackup, true));
-                    rolloutChanges.Add(change);
-                }
-                finally
-                {
-                    if (!files.Any(file => file.Staged == staged)) File.Delete(staged);
-                }
-            }
-
-            if (state is not null)
-            {
-                using var update = Command(state, "UPDATE threads SET model_provider = $provider, rollout_path = COALESCE($path, rollout_path) WHERE id = $id AND archived = 0 AND (model_provider IS NOT $provider OR $path IS NOT NULL)");
-                update.Parameters.AddWithValue("$provider", provider);
-                var idParameter = update.Parameters.Add("$id", SqliteType.Text);
-                var pathParameter = update.Parameters.Add("$path", SqliteType.Text);
-                foreach (var id in activeIds)
-                {
-                    idParameter.Value = id;
-                    pathParameter.Value = replacementPaths.TryGetValue(id, out var replacement) ? replacement : DBNull.Value;
-                    changedThreads += update.ExecuteNonQuery();
-                }
-            }
-            // Legacy byte rewrites move both the projection checkpoint and
-            // persisted turn boundaries. Both belong to the physical rollout,
-            // not necessarily to the logical thread after thread/revert.
-            if (history is not null)
-            {
-                var turnColumns = ReadTableColumns(history, "thread_turns");
-                foreach (var change in rolloutChanges)
-                {
-                    using var query = Command(history, "SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id = $id");
-                    query.Parameters.AddWithValue("$id", change.Id);
-                    var value = query.ExecuteScalar();
-                    if (value is not null)
-                    {
-                        using var update = Command(history, "UPDATE thread_history_projection_state SET next_rollout_byte_offset = $offset WHERE thread_id = $id");
-                        update.Parameters.AddWithValue("$id", change.Id);
-                        update.Parameters.AddWithValue("$offset", ShiftOffset(change, Convert.ToInt64(value)));
-                        update.ExecuteNonQuery();
-                    }
-                    foreach (var column in new[] { "rollout_byte_offset", "rollout_end_byte_offset" })
-                    {
-                        if (!turnColumns.Contains(column)) continue;
-                        var offsets = new List<(string TurnId, long Offset)>();
-                        using (var turns = Command(history, $"SELECT turn_id, {column} FROM thread_turns WHERE thread_id = $id AND {column} IS NOT NULL"))
+                        var change = StageRollout(path, staged, provider, canonicalId);
+                        if (change is null) continue;
+                        // An unchanged duplicate is still ambiguous: never bind a
+                        // changed copy to a cache owned by another physical file.
+                        if (!legacyRolloutIds.Add(change.Id))
+                            throw new IOException($"Duplicate session identity in local rollouts: {change.Id}. No switch was applied.");
+                        if (change.Offsets.Count == 0) continue;
+                        if (change.IsPaginated)
                         {
-                            turns.Parameters.AddWithValue("$id", change.Id);
-                            using var reader = turns.ExecuteReader();
-                            while (reader.Read()) offsets.Add((reader.GetString(0), ShiftOffset(change, reader.GetInt64(1))));
+                            // A new immutable rollout generation preserves every old
+                            // cache and history_base reference, including archives.
+                            var logicalId = Guid.Parse(canonicalId!).ToString();
+                            var timestamp = DateTime.Now.ToString("yyyy-MM-ddTHH-mm-ss", CultureInfo.InvariantCulture);
+                            var name = $"rollout-{timestamp}-{logicalId}_{Guid.NewGuid()}.jsonl";
+                            var replacement = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(path)!, name);
+                            if (File.Exists(replacement)) throw new IOException("The replacement rollout already exists.");
+                            files.Add(new FileChange(replacement, staged, path, false));
+                            replacementPaths.Add(canonicalId!, replacement);
+                            continue;
                         }
-                        foreach (var (turnId, offset) in offsets)
+                        var fileBackup = System.IO.Path.Combine(backupDirectory, $"rollout-{files.Count}.jsonl");
+                        File.Copy(path, fileBackup);
+                        files.Add(new FileChange(path, staged, fileBackup, true));
+                        rolloutChanges.Add(change);
+                    }
+                    finally
+                    {
+                        if (!files.Any(file => file.Staged == staged)) File.Delete(staged);
+                    }
+                }
+
+                if (state is not null)
+                {
+                    if (activeIds.Count > 0) BackupDatabase(state);
+                    using var update = Command(state, "UPDATE threads SET model_provider = $provider, rollout_path = COALESCE($path, rollout_path) WHERE id = $id AND archived = 0 AND (model_provider IS NOT $provider OR $path IS NOT NULL)");
+                    update.Parameters.AddWithValue("$provider", provider);
+                    var idParameter = update.Parameters.Add("$id", SqliteType.Text);
+                    var pathParameter = update.Parameters.Add("$path", SqliteType.Text);
+                    foreach (var id in activeIds)
+                    {
+                        idParameter.Value = id;
+                        pathParameter.Value = replacementPaths.TryGetValue(id, out var replacement) ? replacement : DBNull.Value;
+                        changedThreads += update.ExecuteNonQuery();
+                    }
+                }
+                // Legacy byte rewrites move both the projection checkpoint and
+                // persisted turn boundaries. Both belong to the physical rollout,
+                // not necessarily to the logical thread after thread/revert.
+                var history = rolloutChanges.Count > 0 ? OpenDatabase(historyPath, backupDirectory, databases) : null;
+                if (history is not null)
+                {
+                    var turnColumns = ReadTableColumns(history, "thread_turns");
+                    foreach (var change in rolloutChanges)
+                    {
+                        using var query = Command(history, "SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id = $id");
+                        query.Parameters.AddWithValue("$id", change.Id);
+                        var value = query.ExecuteScalar();
+                        if (value is not null)
                         {
-                            using var update = Command(history, $"UPDATE thread_turns SET {column} = $offset WHERE thread_id = $id AND turn_id = $turn");
+                            BackupDatabase(history);
+                            using var update = Command(history, "UPDATE thread_history_projection_state SET next_rollout_byte_offset = $offset WHERE thread_id = $id");
                             update.Parameters.AddWithValue("$id", change.Id);
-                            update.Parameters.AddWithValue("$turn", turnId);
-                            update.Parameters.AddWithValue("$offset", offset);
+                            update.Parameters.AddWithValue("$offset", ShiftOffset(change, Convert.ToInt64(value)));
                             update.ExecuteNonQuery();
+                        }
+                        foreach (var column in new[] { "rollout_byte_offset", "rollout_end_byte_offset" })
+                        {
+                            if (!turnColumns.Contains(column)) continue;
+                            var offsets = new List<(string TurnId, long Offset)>();
+                            using (var turns = Command(history, $"SELECT turn_id, {column} FROM thread_turns WHERE thread_id = $id AND {column} IS NOT NULL"))
+                            {
+                                turns.Parameters.AddWithValue("$id", change.Id);
+                                using var reader = turns.ExecuteReader();
+                                while (reader.Read()) offsets.Add((reader.GetString(0), ShiftOffset(change, reader.GetInt64(1))));
+                            }
+                            foreach (var (turnId, offset) in offsets)
+                            {
+                                BackupDatabase(history);
+                                using var update = Command(history, $"UPDATE thread_turns SET {column} = $offset WHERE thread_id = $id AND turn_id = $turn");
+                                update.Parameters.AddWithValue("$id", change.Id);
+                                update.Parameters.AddWithValue("$turn", turnId);
+                                update.Parameters.AddWithValue("$offset", offset);
+                                update.ExecuteNonQuery();
+                            }
                         }
                     }
                 }
@@ -226,7 +335,7 @@ internal static class ThreadContinuityService
             foreach (var database in databases)
             {
                 database.Transaction!.Commit();
-                database.Committed = true;
+                database.Committed = File.Exists(database.Backup);
             }
             WriteJournal("complete");
             return Math.Max(changedThreads, rolloutChanges.Count);
@@ -284,8 +393,9 @@ internal static class ThreadContinuityService
         void WriteJournal(string status) => TextFileService.WriteUtf8NoBom(journalPath, JsonSerializer.Serialize(new
         {
             status,
-            files = files.Select(file => new { target = file.Path, backup = file.Backup, existed = file.Existed }),
-            databases = databases.Select(database => new { target = database.Path, backup = database.Backup })
+            files = files.Select(file => new { target = file.Path, backup = System.IO.Path.GetRelativePath(backupPath, file.Backup), existed = file.Existed }),
+            databases = databases.Where(database => File.Exists(database.Backup))
+                .Select(database => new { target = database.Path, backup = System.IO.Path.GetRelativePath(backupPath, database.Backup) })
         }, new JsonSerializerOptions { WriteIndented = true }));
     }
 
@@ -330,10 +440,18 @@ internal static class ThreadContinuityService
             Connection = connection
         };
         databases.Add(database);
-        using (var backup = OpenConnection(database.Backup, SqliteOpenMode.ReadWriteCreate))
-            connection.BackupDatabase(backup);
         database.Transaction = connection.BeginTransaction();
         return database;
+    }
+
+    private static void BackupDatabase(Database database)
+    {
+        if (File.Exists(database.Backup)) return;
+        // A separate read connection includes committed WAL data while our write
+        // transaction prevents another writer from changing it before the update.
+        using var source = OpenConnection(database.Path, SqliteOpenMode.ReadOnly);
+        using var backup = OpenConnection(database.Backup, SqliteOpenMode.ReadWriteCreate);
+        source.BackupDatabase(backup);
     }
 
     private static SqliteCommand Command(Database database, string sql)
@@ -383,7 +501,13 @@ internal static class ThreadContinuityService
 
     private static void StageText(string path, string text, string backups, List<FileChange> files)
     {
-        var staged = path + "." + Guid.NewGuid().ToString("N") + ".switchtmp";
+        if (File.Exists(path))
+        {
+            var current = File.ReadAllText(path);
+            if (System.IO.Path.GetExtension(path) == ".toml" ? TomlOverlayService.Equivalent(current, text)
+                : JsonNode.DeepEquals(JsonNode.Parse(current), JsonNode.Parse(text))) return;
+        }
+        var staged = System.IO.Path.Combine(backups, Guid.NewGuid().ToString("N") + ".switchtmp");
         var backup = System.IO.Path.Combine(backups, System.IO.Path.GetFileName(path));
         var existed = File.Exists(path);
         files.Add(new FileChange(path, staged, backup, existed));

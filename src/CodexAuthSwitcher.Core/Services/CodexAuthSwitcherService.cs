@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using CodexAuthSwitcher.Core.Models;
 using CodexAuthSwitcher.Core.Utilities;
 
@@ -203,24 +204,56 @@ public sealed class CodexAuthSwitcherService
         }
     }
 
+    // Read-only preflight lets the UI avoid closing/restarting Codex for a no-op.
+    // SwitchProfile repeats this check under its lock before making any changes.
+    public bool IsProfileActive(string profileName)
+    {
+        EnsureConfigExists();
+        if (RecoveryPointStore.NeedsAttention(_profileStore.BackupsPath)) return false;
+        var current = File.ReadAllText(ConfigPath);
+        EnsureFileCredentialStore(current);
+        var (config, auth, _) = _profileStore.LoadProfileFilesForSwitch(profileName, current, migrateLegacyAuth: false);
+        return FilesMatch(current, config, auth)
+            && string.IsNullOrEmpty(_runtimeEnvironment.GetOpenAiBaseUrl())
+            && !ThreadContinuityService.NeedsSynchronization(_profileStore.CodexHomePath, current, config);
+    }
+
+    private bool FilesMatch(string currentConfig, string config, string auth) =>
+        File.Exists(AuthPath) && TomlOverlayService.Equivalent(currentConfig, config)
+        && JsonNode.DeepEquals(JsonNode.Parse(File.ReadAllText(AuthPath)), JsonNode.Parse(auth));
+
     public SwitchResult SwitchProfile(string profileName)
     {
-        if (_hasRunningCodex())
-            throw new InvalidOperationException("Close Codex Desktop and Codex CLI tasks before switching accounts or synchronizing conversation routing.");
-        EnsureConfigExists();
+        if (IsProfileActive(profileName))
+            return new SwitchResult
+            {
+                AppliedProfileName = profileName,
+                AlreadyActive = true,
+                ProfileKind = _profileStore.LoadApiProfile(profileName) is null ? ProfileKind.ChatGptSnapshot : ProfileKind.ApiKey
+            };
+        EnsureCodexClosed();
         _profileStore.EnsureLayout();
         using var switchLock = File.Open(Path.Combine(_profileStore.RootPath, "switch.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
-        ThreadContinuityService.EnsureNoInterruptedSwitch(_profileStore.BackupsPath);
+        var recovery = new RecoveryPointStore(_profileStore.BackupsPath, _profileStore.CodexHomePath);
+        recovery.Prepare(EnsureCodexClosed);
         var currentConfigText = File.ReadAllText(ConfigPath);
         EnsureFileCredentialStore(currentConfigText);
         var (configText, authText, kind) = _profileStore.LoadProfileFilesForSwitch(profileName, currentConfigText);
-        var backupPath = _profileStore.BackupLiveFiles(ConfigPath, AuthPath);
-        var synchronizedThreads = ThreadContinuityService.Switch(_profileStore.CodexHomePath, configText, authText, backupPath, () =>
+        var synchronize = ThreadContinuityService.NeedsSynchronization(_profileStore.CodexHomePath, currentConfigText, configText);
+        var filesMatch = FilesMatch(currentConfigText, configText, authText);
+        var environmentChanged = !string.IsNullOrEmpty(_runtimeEnvironment.GetOpenAiBaseUrl());
+        if (filesMatch && !synchronize && !environmentChanged)
+            return new SwitchResult { AppliedProfileName = profileName, ProfileKind = kind, AlreadyActive = true };
+        var synchronizedThreads = 0;
+        var backupPath = string.Empty;
+        if (!filesMatch || synchronize)
         {
-            if (_hasRunningCodex())
-                throw new InvalidOperationException("Codex started while preparing the switch. Close it and try again.");
-        });
-        _runtimeEnvironment.ApplyForProfile(kind == ProfileKind.ApiKey ? _profileStore.LoadApiProfile(profileName) : null);
+            synchronizedThreads = ThreadContinuityService.Switch(_profileStore.CodexHomePath, configText, authText,
+                recovery.PendingPath, EnsureCodexClosed, synchronize);
+            backupPath = recovery.Complete();
+        }
+        if (environmentChanged)
+            _runtimeEnvironment.ApplyForProfile(kind == ProfileKind.ApiKey ? _profileStore.LoadApiProfile(profileName) : null);
 
         try
         {
@@ -256,6 +289,12 @@ public sealed class CodexAuthSwitcherService
         {
             throw new FileNotFoundException("Codex config.toml was not found.", ConfigPath);
         }
+    }
+
+    private void EnsureCodexClosed()
+    {
+        if (_hasRunningCodex())
+            throw new InvalidOperationException("Close Codex Desktop and Codex CLI tasks before switching accounts or synchronizing conversation routing.");
     }
 
     private static void EnsureFileCredentialStore(string configText)

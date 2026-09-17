@@ -566,6 +566,7 @@ public sealed class ThreadContinuityTests : IDisposable
     public void LockedStateDatabase_PreventsAuthSwitch()
     {
         CreateDatabases();
+        CreateRollout("needs-sync", "openai", false, "\n", false);
         var before = File.ReadAllBytes(Path.Combine(_root, "auth.json"));
         using var state = Open(StatePath);
         using var transaction = state.BeginTransaction();
@@ -689,6 +690,270 @@ public sealed class ThreadContinuityTests : IDisposable
         CreateRollout("first", "crs", false, "\n", false);
         var result = _service.SwitchProfile("api-a");
         Assert.Equal("crs", TextScalar(Path.Combine(result.BackupPath, "continuity", "state_5.sqlite"), "SELECT model_provider FROM threads"));
+    }
+
+    [Fact]
+    public void IdenticalProfile_IsReadOnlyEvenWhileCodexIsRunning()
+    {
+        CreateDatabases();
+        var path = CreateRollout("first", "openai", false, "\n", false);
+        _service.SwitchProfile("api-a");
+        // Formatting differences must not cause a switch or backup.
+        var authPath = Path.Combine(_root, "auth.json");
+        File.WriteAllText(authPath, "{\"OPENAI_API_KEY\":\"test-a\"}\n");
+        var configPath = Path.Combine(_root, "config.toml");
+        File.WriteAllText(configPath, File.ReadAllText(configPath).Replace("\"my-provider\"", "'my-provider'"));
+        var before = Directory.GetFiles(_root, "*", SearchOption.AllDirectories)
+            .ToDictionary(file => file, file => (File.ReadAllBytes(file), File.GetLastWriteTimeUtc(file)));
+        var runtime = new FakeRuntime();
+        var inspector = new LiveAuthInspector(runtime);
+        var service = new CodexAuthSwitcherService(new ProfileStore(_root, new ProtectedSecretStore(), inspector), inspector, runtime, () => true);
+        using var rolloutLock = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.None);
+
+        Assert.True(service.IsProfileActive("api-a"));
+        var result = service.SwitchProfile("api-a");
+
+        Assert.True(result.AlreadyActive);
+        Assert.False(result.RestartRequired);
+        Assert.Empty(result.BackupPath);
+        Assert.Equal(before.Keys.Order(), Directory.GetFiles(_root, "*", SearchOption.AllDirectories).Order());
+        foreach (var (file, snapshot) in before)
+        {
+            Assert.Equal(snapshot.Item2, File.GetLastWriteTimeUtc(file));
+            if (file != path) Assert.Equal(snapshot.Item1, File.ReadAllBytes(file));
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SameProvider_ChangesOnlyCredentialsOrSettingsWithoutTouchingHistory(bool changeSettings)
+    {
+        CreateDatabases();
+        var path = CreateRollout("first", "openai", false, "\n", false);
+        _service.SwitchProfile("api-a");
+        var before = new[] { StatePath, HistoryPath, path }.ToDictionary(file => file, File.ReadAllBytes);
+        var spec = _service.LoadApiProfile("api-a")!;
+        spec.Name = "same-provider";
+        if (changeSettings) { spec.Model = "different-model"; spec.BaseUrl = "https://different.example/v1"; }
+        else spec.ApiKey = "different-key";
+        _service.SaveApiProfile(spec);
+        using (var rolloutLock = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.None))
+        using (var databaseLock = File.Open(HistoryPath, FileMode.Open, FileAccess.Read, FileShare.None))
+        using (var state = Open(StatePath))
+        using (var transaction = state.BeginTransaction())
+        {
+            var result = _service.SwitchProfile("same-provider");
+            Assert.False(result.AlreadyActive);
+            Assert.Equal(0, result.SynchronizedThreads);
+            var snapshots = Directory.GetFiles(Path.Combine(result.BackupPath, "continuity"));
+            Assert.Equal(changeSettings ? "config.toml" : "auth.json", Path.GetFileName(Assert.Single(snapshots)));
+        }
+        foreach (var file in before) Assert.Equal(file.Value, File.ReadAllBytes(file.Key));
+        Assert.True(_service.IsProfileActive("same-provider"));
+    }
+
+    [Fact]
+    public void SwitchingChatGptAccounts_DoesNotBackUpOrReadUnchangedHistories()
+    {
+        CreateDatabases();
+        var path = CreateRollout("first", "openai", false, "\n", false);
+        using var rolloutLock = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.None);
+        var result = _service.SwitchProfile("account-a");
+        Assert.Equal(0, result.SynchronizedThreads);
+        Assert.Equal("auth.json", Path.GetFileName(Assert.Single(Directory.GetFiles(Path.Combine(result.BackupPath, "continuity")))));
+    }
+
+    [Fact]
+    public void RepeatedSwitches_KeepOneRecoveryPointAndNoDuplicateSnapshots()
+    {
+        CreateDatabases();
+        CreateRollout("first", "openai", false, "\n", false);
+        foreach (var profile in new[] { "api-a", "api-b", "account-a", "api-a" })
+        {
+            var result = _service.SwitchProfile(profile);
+            Assert.Equal("latest", Path.GetFileName(Assert.Single(Directory.GetDirectories(Path.Combine(_root, "auth-switcher", "backups")))));
+            Assert.Single(Directory.GetFiles(result.BackupPath, "config.toml", SearchOption.AllDirectories));
+            Assert.Single(Directory.GetFiles(result.BackupPath, "auth.json", SearchOption.AllDirectories));
+            var journal = JsonNode.Parse(File.ReadAllText(Path.Combine(result.BackupPath, "continuity-journal.json")))!;
+            foreach (var node in journal["files"]!.AsArray())
+                Assert.True(File.Exists(Path.Combine(result.BackupPath, node!["backup"]!.GetValue<string>())));
+        }
+    }
+
+    [Fact]
+    public void NewlyUnarchivedConversation_IsSynchronizedEvenWhenProfileMatches()
+    {
+        CreateDatabases();
+        var path = CreateRollout("first", "openai", true, "\n", false);
+        _service.SwitchProfile("api-a");
+        var destination = Path.Combine(_root, "sessions", "first.jsonl");
+        Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+        File.Move(path, destination);
+        using (var state = Open(StatePath))
+        using (var update = state.CreateCommand())
+        {
+            update.CommandText = "UPDATE threads SET archived=0, rollout_path=$path";
+            update.Parameters.AddWithValue("$path", destination);
+            update.ExecuteNonQuery();
+        }
+        Assert.False(_service.IsProfileActive("api-a"));
+        var result = _service.SwitchProfile("api-a");
+        Assert.False(result.AlreadyActive);
+        Assert.Equal(1, result.SynchronizedThreads);
+        AssertProvider(destination, "my-provider");
+        Assert.Empty(Directory.GetFiles(result.BackupPath, "*.toml", SearchOption.AllDirectories));
+        Assert.Empty(Directory.GetFiles(result.BackupPath, "auth.json", SearchOption.AllDirectories));
+    }
+
+    [Fact]
+    public void Synchronization_SkipsAlreadyMatchingRolloutAndUnreferencedCopies()
+    {
+        CreateDatabases();
+        var matching = CreateRollout("matching", "my-provider", false, "\n", false);
+        var changing = CreateRollout("changing", "openai", false, "\n", false);
+        File.WriteAllText(Path.Combine(_root, "sessions", "unreferenced.jsonl"), "invalid unused history");
+        using var rolloutLock = File.Open(matching, FileMode.Open, FileAccess.Read, FileShare.None);
+        var result = _service.SwitchProfile("api-a");
+        Assert.Equal(1, result.SynchronizedThreads);
+        AssertProvider(changing, "my-provider");
+        Assert.Single(Directory.GetFiles(Path.Combine(result.BackupPath, "continuity"), "rollout-*.jsonl"));
+    }
+
+    [Fact]
+    public void FailedSwitch_KeepsLastSuccessfulRecoveryPointUntilRetrySucceeds()
+    {
+        CreateDatabases();
+        CreateRollout("first", "openai", false, "\n", false);
+        var first = _service.SwitchProfile("api-a");
+        var original = Directory.GetFiles(first.BackupPath, "*", SearchOption.AllDirectories).ToDictionary(file => file, File.ReadAllBytes);
+        using (var authLock = File.Open(Path.Combine(_root, "auth.json"), FileMode.Open, FileAccess.Read, FileShare.Read))
+            Assert.Throws<IOException>(() => _service.SwitchProfile("api-b"));
+        foreach (var file in original) Assert.Equal(file.Value, File.ReadAllBytes(file.Key));
+        _service.SwitchProfile("api-b");
+        Assert.Single(Directory.GetDirectories(Path.Combine(_root, "auth-switcher", "backups")));
+    }
+
+    [Fact]
+    public void InterruptedSwitch_AutomaticallyRestoresFilesDatabaseAndAuthBeforeRetry()
+    {
+        CreateDatabases();
+        var path = CreateRollout("first", "openai", false, "\n", false);
+        var before = new[] { path, Path.Combine(_root, "config.toml"), Path.Combine(_root, "auth.json") }
+            .ToDictionary(file => file, File.ReadAllBytes);
+        var result = _service.SwitchProfile("api-a");
+        var pending = SimulateInterruptedSwitch(result.BackupPath);
+
+        var retry = _service.SwitchProfile("account-b");
+
+        Assert.True(retry.AlreadyActive);
+        foreach (var file in before) Assert.Equal(file.Value, File.ReadAllBytes(file.Key));
+        Assert.Equal("openai", TextScalar(StatePath, "SELECT model_provider FROM threads"));
+        Assert.Equal(new FileInfo(path).Length, Scalar(HistoryPath, "SELECT next_rollout_byte_offset FROM thread_history_projection_state"));
+        Assert.False(Directory.Exists(pending));
+    }
+
+    [Fact]
+    public void IncompleteRecoverySource_BlocksBeforeRestoringAnyLiveFiles()
+    {
+        CreateDatabases();
+        var path = CreateRollout("first", "openai", false, "\n", false);
+        var result = _service.SwitchProfile("api-a");
+        var pending = SimulateInterruptedSwitch(result.BackupPath);
+        File.Delete(Path.Combine(pending, "continuity", "auth.json"));
+        var before = new[] { path, StatePath, HistoryPath, Path.Combine(_root, "config.toml"), Path.Combine(_root, "auth.json") }
+            .ToDictionary(file => file, File.ReadAllBytes);
+        Assert.Throws<IOException>(() => _service.SwitchProfile("account-b"));
+        foreach (var file in before) Assert.Equal(file.Value, File.ReadAllBytes(file.Key));
+        Assert.True(Directory.Exists(pending));
+    }
+
+    [Fact]
+    public void SuccessfulSwitchInterruptedDuringPromotion_PreservesAppliedRoute()
+    {
+        var result = _service.SwitchProfile("api-a");
+        var root = Path.GetDirectoryName(result.BackupPath)!;
+        Directory.Move(result.BackupPath, Path.Combine(root, "pending"));
+        var retry = _service.SwitchProfile("api-a");
+        Assert.True(retry.AlreadyActive);
+        Assert.Equal("my-provider", _service.GetEnvironment().ModelProvider);
+        Assert.Equal("latest", Path.GetFileName(Assert.Single(Directory.GetDirectories(root))));
+    }
+
+    [Fact]
+    public void AlreadyActiveLegacyAccount_DoesNotMigrateOrRewriteProfileDuringPreflight()
+    {
+        var profile = Path.Combine(_root, "auth-switcher", "profiles", "account-b");
+        var legacy = Path.Combine(profile, "auth.json");
+        File.Copy(Path.Combine(_root, "auth.json"), legacy);
+        File.Delete(Path.Combine(profile, "auth.bin"));
+        Assert.True(_service.IsProfileActive("account-b"));
+        Assert.True(_service.SwitchProfile("account-b").AlreadyActive);
+        Assert.True(File.Exists(legacy));
+        Assert.False(File.Exists(Path.Combine(profile, "auth.bin")));
+    }
+
+    [Fact]
+    public void PaginatedCrashRecovery_RemovesOnlyNewGenerationAndDoesNotBackUpUnchangedCache()
+    {
+        const string id = "77777777-7777-4777-8777-777777777777";
+        CreateDatabases();
+        var path = CreateRollout(id, "openai", false, "\n", false);
+        var lines = File.ReadAllLines(path);
+        var header = JsonNode.Parse(lines[0])!;
+        header["payload"]!["history_mode"] = "paginated";
+        lines[0] = header.ToJsonString();
+        File.WriteAllText(path, string.Join("\n", lines) + "\n", new UTF8Encoding(false));
+        var original = File.ReadAllBytes(path);
+        var history = File.ReadAllBytes(HistoryPath);
+        var result = _service.SwitchProfile("api-a");
+        var replacement = TextScalar(StatePath, "SELECT rollout_path FROM threads");
+        Assert.NotEqual(path, replacement);
+        Assert.False(File.Exists(Path.Combine(result.BackupPath, "continuity", "thread_history_1.sqlite")));
+        SimulateInterruptedSwitch(result.BackupPath);
+
+        Assert.True(_service.SwitchProfile("account-b").AlreadyActive);
+        Assert.Equal(path, TextScalar(StatePath, "SELECT rollout_path FROM threads"));
+        Assert.Equal(original, File.ReadAllBytes(path));
+        Assert.Equal(history, File.ReadAllBytes(HistoryPath));
+        Assert.False(File.Exists(replacement));
+    }
+
+    [Fact]
+    public void LegacyRecovery_IsCheckedOnceAndOldCheckpointsArePreserved()
+    {
+        var result = _service.SwitchProfile("api-a");
+        var root = Path.GetDirectoryName(result.BackupPath)!;
+        var legacy = Path.Combine(root, "20260917_120000_000");
+        Directory.Move(result.BackupPath, legacy);
+        File.Delete(Path.Combine(root, "recovery-v2"));
+        var journalPath = Path.Combine(legacy, "continuity-journal.json");
+        var journal = JsonNode.Parse(File.ReadAllText(journalPath))!;
+        journal["status"] = "applying";
+        foreach (var node in journal["files"]!.AsArray())
+            node!["backup"] = Path.GetFullPath(node["backup"]!.GetValue<string>(), legacy);
+        File.WriteAllText(journalPath, journal.ToJsonString());
+
+        Assert.True(_service.SwitchProfile("account-b").AlreadyActive);
+        Assert.Equal("rolled-back", JsonNode.Parse(File.ReadAllText(journalPath))!["status"]!.GetValue<string>());
+        Assert.True(File.Exists(Path.Combine(root, "recovery-v2")));
+        File.WriteAllText(journalPath, "old journal deliberately unreadable after one-time migration");
+        _service.SwitchProfile("api-a");
+        _service.SwitchProfile("api-b");
+        Assert.True(Directory.Exists(legacy));
+        Assert.Equal("old journal deliberately unreadable after one-time migration", File.ReadAllText(journalPath));
+        Assert.Equal(new[] { "20260917_120000_000", "latest" }, Directory.GetDirectories(root).Select(Path.GetFileName).Order());
+    }
+
+    private static string SimulateInterruptedSwitch(string completedPath)
+    {
+        var pending = Path.Combine(Path.GetDirectoryName(completedPath)!, "pending");
+        Directory.Move(completedPath, pending);
+        var journalPath = Path.Combine(pending, "continuity-journal.json");
+        var journal = JsonNode.Parse(File.ReadAllText(journalPath))!;
+        journal["status"] = "applying";
+        File.WriteAllText(journalPath, journal.ToJsonString());
+        return pending;
     }
 
     private void CreateDatabases()

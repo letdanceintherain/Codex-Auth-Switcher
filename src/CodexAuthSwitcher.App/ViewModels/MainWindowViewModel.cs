@@ -22,6 +22,7 @@ public sealed class MainWindowViewModel : ViewModelBase
     private LiveAuthIdentity? _liveIdentity;
     private bool _isCodexRunning;
     private string _statusMessage = string.Empty;
+    private string _switchDetails = string.Empty;
     private string _statusKey = "Status.Ready";
     private object[] _statusArgs = [];
     private bool _isBusy;
@@ -147,6 +148,12 @@ public sealed class MainWindowViewModel : ViewModelBase
                 RaiseCommandStateChanged();
             }
         }
+    }
+
+    public string SwitchDetails
+    {
+        get => _switchDetails;
+        private set => SetProperty(ref _switchDetails, value);
     }
 
     public ProfileItemViewModel? SelectedProfile
@@ -329,6 +336,15 @@ public sealed class MainWindowViewModel : ViewModelBase
             return;
         }
 
+        var profileName = SelectedProfile.Name;
+        var alreadyActive = await RunBusyAsync(() => Task.Run<bool?>(() => _switcherService.IsProfileActive(profileName)));
+        if (alreadyActive is null) return;
+        if (alreadyActive == true)
+        {
+            SwitchDetails = string.Empty;
+            SetStatus("Status.AlreadyActive", profileName);
+            return;
+        }
         var processState = _desktopProcessService.GetDesktopAppState();
         _desktopAppPath = processState.DesktopAppPath ?? _desktopAppPath;
         if (processState.IsRunning)
@@ -365,8 +381,9 @@ public sealed class MainWindowViewModel : ViewModelBase
 
         var result = await RunBusyAsync(() => Task.Run(() =>
         {
-            var switchResult = _switcherService.SwitchProfile(SelectedProfile.Name);
-            var restartMethod = _desktopProcessService.RestartDesktopApp(_desktopAppPath);
+            var switchResult = _switcherService.SwitchProfile(profileName);
+            var restartMethod = switchResult.RestartRequired || processState.IsRunning
+                ? _desktopProcessService.RestartDesktopApp(_desktopAppPath) : RestartMethod.None;
             return new SwitchExecutionResult
             {
                 SwitchResult = switchResult,
@@ -378,6 +395,13 @@ public sealed class MainWindowViewModel : ViewModelBase
             return;
         }
 
+        if (result.SwitchResult.AlreadyActive && !processState.IsRunning)
+        {
+            SwitchDetails = string.Empty;
+            SetStatus("Status.AlreadyActive", profileName);
+            return;
+        }
+
         if (result.RestartMethod == RestartMethod.None)
         {
             _dialogService.ShowError(
@@ -386,6 +410,8 @@ public sealed class MainWindowViewModel : ViewModelBase
         }
 
         await RefreshAsync();
+        SwitchDetails = string.IsNullOrEmpty(result.SwitchResult.BackupPath) ? string.Empty
+            : _localizationService.Format("Status.SwitchDetails", result.SwitchResult.SynchronizedThreads, result.SwitchResult.BackupPath);
         if (result.RestartMethod == RestartMethod.None)
         {
             SetStatus("Status.SwitchedRestartFailed", result.SwitchResult.AppliedProfileName, result.SwitchResult.SynchronizedThreads);

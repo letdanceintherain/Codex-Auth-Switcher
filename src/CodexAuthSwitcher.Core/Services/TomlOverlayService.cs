@@ -1,4 +1,7 @@
 using System.Text.Json;
+using System.Text.Json.Nodes;
+using Tomlyn;
+using Tomlyn.Model;
 using CodexAuthSwitcher.Core.Models;
 using Tomlyn.Parsing;
 using Tomlyn.Syntax;
@@ -76,6 +79,9 @@ public static class TomlOverlayService
     }
 
     public static void Validate(string text) => Parse(text);
+    public static bool Equivalent(string left, string right) => left == right || JsonNode.DeepEquals(
+        JsonSerializer.SerializeToNode(TomlSerializer.Deserialize<TomlTable>(left)),
+        JsonSerializer.SerializeToNode(TomlSerializer.Deserialize<TomlTable>(right)));
     public static string ProviderSection(string provider) =>
         "model_providers." + (BareKeySyntax.IsBareKey(provider) ? provider : Literal(provider));
     public static string? TryReadScalar(string text, string key) =>

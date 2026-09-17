@@ -380,9 +380,24 @@
                 Background="#11284C"
                 Padding="14,12">
             <Grid>
-                <TextBlock Foreground="White"
-                           Text="{Binding StatusMessage}"
-                           VerticalAlignment="Center" />
+                <StackPanel Margin="0,0,175,0">
+                    <TextBlock Foreground="White"
+                               Text="{Binding StatusMessage}"
+                               TextWrapping="Wrap" />
+                    <Expander Foreground="White" Margin="0,6,0,0"
+                              Header="{Binding Source={x:Static app:App.Localization}, Path=[Common.Details]}">
+                        <Expander.Style>
+                            <Style TargetType="Expander">
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding SwitchDetails}" Value="">
+                                        <Setter Property="Visibility" Value="Collapsed" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Expander.Style>
+                        <TextBlock Text="{Binding SwitchDetails}" TextWrapping="Wrap" />
+                    </Expander>
+                </StackPanel>
                 <ProgressBar Width="160"
                              Height="10"
                              HorizontalAlignment="Right"

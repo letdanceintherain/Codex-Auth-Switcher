@@ -63,21 +63,6 @@ public sealed class CodexDesktopProcessService
             Thread.Sleep(200);
         }
 
-        foreach (var process in GetDesktopProcesses())
-        {
-            try
-            {
-                if (!process.HasExited)
-                {
-                    process.Kill(entireProcessTree: true);
-                    process.WaitForExit((int)Math.Max(500, timeout.TotalMilliseconds));
-                }
-            }
-            catch
-            {
-            }
-        }
-
         return GetDesktopProcesses().Count == 0;
     }
 

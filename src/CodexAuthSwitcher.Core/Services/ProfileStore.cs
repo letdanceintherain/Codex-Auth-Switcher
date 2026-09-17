@@ -209,7 +209,7 @@ public sealed class ProfileStore
         }
     }
 
-    public (string ConfigText, string AuthText, ProfileKind Kind) LoadProfileFilesForSwitch(string profileName, string currentConfigText)
+    public (string ConfigText, string AuthText, ProfileKind Kind) LoadProfileFilesForSwitch(string profileName, string currentConfigText, bool migrateLegacyAuth = true)
     {
         var profilePath = GetProfilePath(profileName);
         var metadata = LoadMetadata(profilePath) ?? throw new InvalidOperationException($"Profile '{profileName}' does not exist.");
@@ -218,7 +218,7 @@ public sealed class ProfileStore
         {
             var configPath = Path.Combine(profilePath, ConfigSnapshotFileName);
             var snapshotConfigText = File.Exists(configPath) ? File.ReadAllText(configPath) : string.Empty;
-            var authText = ReadChatGptAuth(profilePath)
+            var authText = ReadChatGptAuth(profilePath, migrateLegacyAuth)
                 ?? throw new InvalidOperationException($"ChatGPT profile '{profileName}' does not contain a usable auth snapshot.");
             var chatGptConfigText = TomlOverlayService.ApplyChatGptOverlay(currentConfigText, snapshotConfigText);
             return (chatGptConfigText, authText, kind);
@@ -304,26 +304,6 @@ public sealed class ProfileStore
         {
             File.Delete(CurrentProfileStatePath);
         }
-    }
-
-    public string BackupLiveFiles(string configPath, string authPath)
-    {
-        EnsureLayout();
-        var backupName = DateTime.Now.ToString("yyyyMMdd_HHmmss_fff");
-        var backupPath = Path.Combine(BackupsPath, backupName);
-        for (var suffix = 2; Directory.Exists(backupPath); suffix++)
-        {
-            backupPath = Path.Combine(BackupsPath, $"{backupName}_{suffix}");
-        }
-
-        PathHelpers.EnsureDirectory(backupPath);
-        File.Copy(configPath, Path.Combine(backupPath, ConfigSnapshotFileName), overwrite: true);
-        if (File.Exists(authPath))
-        {
-            File.Copy(authPath, Path.Combine(backupPath, AuthSnapshotFileName), overwrite: true);
-        }
-
-        return backupPath;
     }
 
     public string GetProfilePath(string profileName)
@@ -460,7 +440,7 @@ public sealed class ProfileStore
         return null;
     }
 
-    private string? ReadChatGptAuth(string profilePath)
+    private string? ReadChatGptAuth(string profilePath, bool migrate = true)
     {
         var protectedPath = Path.Combine(profilePath, ProtectedAuthSnapshotFileName);
         if (File.Exists(protectedPath))
@@ -484,6 +464,7 @@ public sealed class ProfileStore
         try
         {
             var authText = File.ReadAllText(legacyPath);
+            if (!migrate) return authText;
             _secretStore.SaveSecret(protectedPath, authText);
             try
             {

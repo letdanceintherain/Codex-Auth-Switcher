@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.3.0 - 2026-09-17
+
+- Skip identical profiles without rewriting files, creating backups or restarting Codex; compare TOML/JSON values independently of formatting.
+- Query active conversation routes read-only and synchronize only mismatched indexed histories, including newly unarchived conversations. Matching routes allow credential/model/endpoint changes without database writes or full history scans.
+- Retain one recovery point for new switches, remove duplicate config/auth snapshots, and back up each database only when an update is required. Preserve the prior recovery point until the next switch succeeds.
+- Automatically restore an interrupted operation from its journal with Codex closed; preserve unavailable/ambiguous recovery data and finish interrupted recovery-point rotation on retry.
+- Inspect old top-level journals once on upgrade. Preserve pre-upgrade backups, user-created checkpoints and referenced paginated history generations.
+- Simplify success messages, move technical details into a collapsed Details panel, and remove forced process termination after normal closure times out.
+- Add regression coverage for no-op switching, locked but unchanged histories, recovery retention, interrupted writes and provider-selective synchronization.
+
 ## 1.2.2 - 2026-09-15
 
 - Select active rollouts from SQLite's logical thread ID / current path mapping; unreferenced old copies no longer cause false duplicate-ID failures.
