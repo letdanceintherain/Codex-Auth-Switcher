@@ -1,5 +1,4 @@
 using System.Text.Json;
-using System.Text.Json.Nodes;
 using CodexAuthSwitcher.Core.Models;
 using CodexAuthSwitcher.Core.Utilities;
 
@@ -76,7 +75,9 @@ public sealed class CodexAuthSwitcherService
             return new IdentitySyncResult();
         }
 
-        var existing = _profileStore.FindProfileByIdentityFingerprint(liveIdentity.IdentityFingerprint);
+        var existing = liveIdentity.Kind == ProfileKind.ChatGptSnapshot
+            ? _profileStore.FindChatGptProfileForAuth(authText)
+            : _profileStore.FindProfileByIdentityFingerprint(liveIdentity.IdentityFingerprint);
         if (existing is not null)
         {
             if (existing.Kind == ProfileKind.ChatGptSnapshot)
@@ -220,7 +221,7 @@ public sealed class CodexAuthSwitcherService
 
     private bool FilesMatch(string currentConfig, string config, string auth) =>
         File.Exists(AuthPath) && TomlOverlayService.Equivalent(currentConfig, config)
-        && JsonNode.DeepEquals(JsonNode.Parse(File.ReadAllText(AuthPath)), JsonNode.Parse(auth));
+        && AuthComparisonService.Equivalent(File.ReadAllText(AuthPath), auth);
 
     public SwitchResult SwitchProfile(string profileName)
     {
@@ -238,12 +239,18 @@ public sealed class CodexAuthSwitcherService
         recovery.Prepare(EnsureCodexClosed);
         var currentConfigText = File.ReadAllText(ConfigPath);
         EnsureFileCredentialStore(currentConfigText);
-        var (configText, authText, kind) = _profileStore.LoadProfileFilesForSwitch(profileName, currentConfigText);
+        var (configText, authText, kind) = _profileStore.LoadProfileFilesForSwitch(profileName, currentConfigText, migrateLegacyAuth: false);
         var synchronize = ThreadContinuityService.NeedsSynchronization(_profileStore.CodexHomePath, currentConfigText, configText);
         var filesMatch = FilesMatch(currentConfigText, configText, authText);
         var environmentChanged = !string.IsNullOrEmpty(_runtimeEnvironment.GetOpenAiBaseUrl());
         if (filesMatch && !synchronize && !environmentChanged)
             return new SwitchResult { AppliedProfileName = profileName, ProfileKind = kind, AlreadyActive = true };
+        // Capture tokens only during a real switch, after Codex has stopped refreshing
+        // them. Keep the saved model overlay intact when updating account credentials.
+        EnsureCodexClosed();
+        if (File.Exists(AuthPath))
+            _profileStore.RefreshSavedChatGptAuth(File.ReadAllText(AuthPath));
+        (configText, authText, kind) = _profileStore.LoadProfileFilesForSwitch(profileName, currentConfigText);
         var synchronizedThreads = 0;
         var backupPath = string.Empty;
         if (!filesMatch || synchronize)

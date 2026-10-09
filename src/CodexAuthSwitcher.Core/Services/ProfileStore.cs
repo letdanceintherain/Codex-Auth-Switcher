@@ -68,6 +68,20 @@ public sealed class ProfileStore
             string.Equals(item.IdentityFingerprint, fingerprint, StringComparison.OrdinalIgnoreCase));
     }
 
+    public ProfileSummary? FindChatGptProfileForAuth(string authText)
+    {
+        if (!Directory.Exists(ProfilesPath)) return null;
+        foreach (var profilePath in Directory.EnumerateDirectories(ProfilesPath).OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
+        {
+            var metadata = LoadMetadata(profilePath);
+            if (metadata is null || ParseKind(metadata.Kind ?? metadata.Mode) != ProfileKind.ChatGptSnapshot) continue;
+            var savedAuth = ReadChatGptAuth(profilePath, migrate: false);
+            if (savedAuth is not null && AuthComparisonService.Equivalent(authText, savedAuth))
+                return LoadProfileSummary(profilePath);
+        }
+        return null;
+    }
+
     public string CreateUniqueProfileName(LiveAuthIdentity identity)
     {
         EnsureLayout();
@@ -198,6 +212,29 @@ public sealed class ProfileStore
 
         WriteMetadata(profilePath, metadata);
         _secretStore.SaveSecret(Path.Combine(profilePath, SecretFileName), spec.ApiKey);
+    }
+
+    public void RefreshSavedChatGptAuth(string liveAuthText)
+    {
+        var liveAccountId = AuthComparisonService.TryGetChatGptAccountId(liveAuthText);
+        if (liveAccountId is null || !Directory.Exists(ProfilesPath)) return;
+
+        foreach (var profilePath in Directory.EnumerateDirectories(ProfilesPath))
+        {
+            var metadata = LoadMetadata(profilePath);
+            if (metadata is null || ParseKind(metadata.Kind ?? metadata.Mode) != ProfileKind.ChatGptSnapshot) continue;
+            var savedAuth = ReadChatGptAuth(profilePath, migrate: false);
+            if (savedAuth is null || !string.Equals(liveAccountId,
+                    AuthComparisonService.TryGetChatGptAccountId(savedAuth), StringComparison.Ordinal)) continue;
+            if (string.Equals(savedAuth, liveAuthText, StringComparison.Ordinal)) continue;
+
+            // Preserve each profile's model configuration and replace only rotated auth.
+            _secretStore.SaveSecret(Path.Combine(profilePath, ProtectedAuthSnapshotFileName), liveAuthText);
+            var legacyAuthPath = Path.Combine(profilePath, AuthSnapshotFileName);
+            if (File.Exists(legacyAuthPath)) File.Delete(legacyAuthPath);
+            metadata.UpdatedAt = DateTimeOffset.UtcNow;
+            WriteMetadata(profilePath, metadata);
+        }
     }
 
     public void DeleteProfile(string profileName)

@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.4.0 - 2026-10-09
+
+- Stop making full paginated conversation copies on routine provider switches. Rewrite the first routing header at exactly its existing byte length and append a complete native settings event, preserving every existing message, ordinal, and inherited-history byte boundary.
+- Keep only the old header and the intended settings append for rollout recovery. Restore partial writes safely, refuse to truncate independently appended content, and verify new fallback generations before deleting them during recovery.
+- When a header lacks room or a rollout cannot use fixed-width routing, reuse an equivalent indexed-safe generation when available; otherwise create a compatible immutable generation with reserved header space for subsequent switches. Preserve old histories and archives.
+- Treat matching API keys/auth modes as unchanged despite incidental auth fields. Recognize the same trusted ChatGPT account after token refresh and preserve its current usable credentials before a real switch.
+- Skip history-cache backups and SQL updates when legacy byte offsets do not actually change. Continue retaining one recovery point only for changed state.
+- Verify six provider switches with real Codex resumes, stable paginated generation counts, real forks, and a loopback model-context check using Desktop backend 0.162.0-alpha.2.
+
 ## 1.3.0 - 2026-09-17
 
 - Skip identical profiles without rewriting files, creating backups or restarting Codex; compare TOML/JSON values independently of formatting.

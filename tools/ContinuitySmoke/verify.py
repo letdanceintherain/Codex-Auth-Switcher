@@ -108,10 +108,17 @@ for index in range(8):
     copy.write_bytes(rollout.read_bytes())
     copies.append((copy, hashlib.sha256(copy.read_bytes()).hexdigest()))
 
-for provider in ['my-provider','second-provider','openai']:
+baseline_generation_count = None
+latest_followup = None
+for provider in ['my-provider','second-provider','openai','my-provider','openai','second-provider']:
     runner = [os.environ['SWITCHER_SMOKE_EXE']] if os.environ.get('SWITCHER_SMOKE_EXE') else [
         'dotnet','run','--project',str(BASE/'smoke.csproj'),'--']
     subprocess.run(runner + [str(ROOT),provider], check=True, env=ENV)
+    generations = len(list((ROOT/'sessions').rglob('rollout-*.jsonl')))
+    if baseline_generation_count is not None and os.environ.get('SWITCHER_SMOKE_PAGINATED') == '1':
+        assert generations == baseline_generation_count, 'Routine provider switch created redundant history generations'
+        print(f'ROUTING {provider}: history generation count remains {generations}', flush=True)
+    baseline_generation_count = generations
     with Server() as server:
         threads = server.rpc('thread/list', {})['data']
         assert any(r['id'] == THREAD for r in threads), 'Original thread missing from default list'
@@ -126,6 +133,17 @@ for provider in ['my-provider','second-provider','openai']:
             assert resumed['thread']['id'] == thread_id, resumed
             assert resumed['modelProvider'] == provider, resumed
             assert text in json.dumps(resumed), 'Original conversation content missing on resume'
+            if thread_id == THREAD and latest_followup is not None:
+                assert latest_followup in json.dumps(resumed), 'New message lost on provider switch'
+        if os.environ.get('SWITCHER_SMOKE_CONTEXT') == '1':
+            followup = f'Isolated message on {provider}: {uuid.uuid4()}'
+            server.rpc('turn/start', {'threadId': THREAD, 'input': [
+                {'type': 'text', 'text': followup}]})
+            request = captured_requests.get(timeout=30)
+            assert text.encode('utf-8') in request, 'Original message missing from model request'
+            if latest_followup is not None:
+                assert latest_followup.encode('utf-8') in request, 'Previous new message missing from model request'
+            latest_followup = followup
         print(f'AFTER {provider}: original and both forks readable and resumed', flush=True)
     for copy, digest in copies:
         assert hashlib.sha256(copy.read_bytes()).hexdigest() == digest, 'Unindexed copy changed'

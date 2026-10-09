@@ -945,6 +945,27 @@ public sealed class ThreadContinuityTests : IDisposable
         Assert.Equal(new[] { "20260917_120000_000", "latest" }, Directory.GetDirectories(root).Select(Path.GetFileName).Order());
     }
 
+    [Fact]
+    public void EqualLengthProviderChange_DoesNotBackUpOrWriteUnchangedHistoryOffsets()
+    {
+        CreateDatabases();
+        var path = CreateRollout("equal-length", "aaaa", false, "\n", false);
+        // Use the same serializer as the overlay so only the provider bytes change.
+        File.WriteAllLines(path, File.ReadAllLines(path).Select(line => JsonNode.Parse(line)!.ToJsonString()), new UTF8Encoding(false));
+        var length = new FileInfo(path).Length;
+        Execute(HistoryPath, $"UPDATE thread_history_projection_state SET next_rollout_byte_offset={length}");
+        Execute(HistoryPath, $"INSERT INTO thread_turns(thread_id, turn_id, rollout_ordinal, status, rollout_byte_offset, rollout_end_byte_offset) VALUES('equal-length','turn',1,'completed',0,{length})");
+        var before = File.ReadAllBytes(HistoryPath);
+        _service.SaveApiProfile(new ApiProfileSpec { Name = "equal", Provider = "bbbb", BaseUrl = "http://127.0.0.1:1/v1", ApiKey = "test-equal" });
+
+        var result = _service.SwitchProfile("equal");
+
+        Assert.Equal(length, new FileInfo(path).Length);
+        Assert.Equal(before, File.ReadAllBytes(HistoryPath));
+        Assert.False(File.Exists(Path.Combine(result.BackupPath, "continuity", "thread_history_1.sqlite")));
+        Assert.True(File.Exists(Path.Combine(result.BackupPath, "continuity", "state_5.sqlite")));
+    }
+
     private static string SimulateInterruptedSwitch(string completedPath)
     {
         var pending = Path.Combine(Path.GetDirectoryName(completedPath)!, "pending");

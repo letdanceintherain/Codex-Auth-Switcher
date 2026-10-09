@@ -1,4 +1,6 @@
 using System.Globalization;
+using System.Security.Cryptography;
+using System.Buffers.Binary;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -9,13 +11,16 @@ namespace CodexAuthSwitcher.Core.Services;
 /// <summary>
 /// Changes routing metadata, never conversation content or thread identity.
 /// Call only after Codex has exited. All databases are backed up through SQLite
-/// (including WAL data) and all changed rollouts are backed up before any writes.
+/// (including WAL data). Paginated routing keeps byte boundaries stable and
+/// records only its original header and append operation for recovery.
 /// </summary>
 internal static class ThreadContinuityService
 {
-    private sealed record FileChange(string Path, string Staged, string Backup, bool Existed);
+    private sealed record FileChange(string Path, string Staged, string Backup, bool Existed,
+        long? ExpectedLength = null, string? ExpectedHash = null);
     private sealed record OffsetChange(long Start, long End, long Delta);
     private sealed record RolloutChange(string Id, long OriginalLength, List<OffsetChange> Offsets, bool IsPaginated);
+    private sealed record RolloutFingerprint(string Hash, bool HasTargetRouting);
 
     private sealed class Database : IDisposable
     {
@@ -79,10 +84,20 @@ internal static class ThreadContinuityService
         var files = journal["files"]!.AsArray().Select(node => (
             Target: NormalizePath(node!["target"]!.GetValue<string>(), codexHome),
             Backup: NormalizePath(node["backup"]!.GetValue<string>(), backupPath),
-            Existed: node["existed"]!.GetValue<bool>())).ToList();
+            Existed: node["existed"]!.GetValue<bool>(),
+            ExpectedLength: node["expectedLength"]?.GetValue<long>(),
+            ExpectedHash: node["expectedHash"]?.GetValue<string>())).ToList();
         var databases = journal["databases"]!.AsArray().Select(node => (
             Target: NormalizePath(node!["target"]!.GetValue<string>(), codexHome),
             Backup: NormalizePath(node["backup"]!.GetValue<string>(), backupPath))).ToList();
+        var patches = journal["routingPatches"]?.AsArray().Select(node => new RoutingPatch(
+            NormalizePath(node!["target"]!.GetValue<string>(), codexHome),
+            node["originalLength"]!.GetValue<long>(),
+            NormalizePath(node["headerBefore"]!.GetValue<string>(), backupPath),
+            NormalizePath(node["headerAfter"]!.GetValue<string>(), backupPath),
+            NormalizePath(node["append"]!.GetValue<string>(), backupPath),
+            node["headerLength"]!.GetValue<int>(),
+            node["expectedLength"]!.GetValue<long>())).ToList() ?? [];
         var configBackup = files.FirstOrDefault(file => string.Equals(file.Target, configPath, StringComparison.OrdinalIgnoreCase));
         var config = File.ReadAllText(configBackup.Existed ? configBackup.Backup : configPath);
         var sqliteHome = ResolveSqliteHome(codexHome, config);
@@ -114,7 +129,21 @@ internal static class ThreadContinuityService
             ValidateRecoverySource(database.Backup, backupPath);
             using var source = OpenConnection(database.Backup, SqliteOpenMode.ReadOnly);
         }
+        foreach (var patch in patches)
+        {
+            EnsureLocalRollout(codexHome, patch.Path);
+            if (!patch.Path.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase))
+                throw new IOException("Recovery routing target is not a local rollout.");
+            ValidateRecoverySource(patch.HeaderBeforePath, backupPath);
+            ValidateRecoverySource(patch.HeaderAfterPath, backupPath);
+            ValidateRecoverySource(patch.AppendPath, backupPath);
+        }
         beforeRestore();
+        // Stop Codex before inspecting live patch state: a normal exit can
+        // flush final records. Reject additional content before restoring DBs.
+        foreach (var patch in patches) FixedWidthRoutingService.ValidateRestore(patch);
+        foreach (var file in files.Where(file => !file.Existed))
+            ValidateNewGeneration(file.Target, file.ExpectedLength, file.ExpectedHash);
         foreach (var database in databases)
         {
             using var source = OpenConnection(database.Backup, SqliteOpenMode.ReadOnly);
@@ -128,6 +157,7 @@ internal static class ThreadContinuityService
             File.Copy(file.Backup, staged, overwrite: true);
             File.Move(staged, file.Target, overwrite: true);
         }
+        foreach (var patch in patches.AsEnumerable().Reverse()) FixedWidthRoutingService.Restore(patch);
         journal["status"] = "rolled-back";
         TextFileService.WriteUtf8NoBom(journalPath, journal.ToJsonString());
         return "rolled-back";
@@ -152,6 +182,8 @@ internal static class ThreadContinuityService
         var files = new List<FileChange>();
         var databases = new List<Database>();
         var applied = new List<FileChange>();
+        var patches = new List<RoutingPatch>();
+        var appliedPatches = new List<RoutingPatch>();
         var rolloutChanges = new List<RolloutChange>();
         var journalPath = System.IO.Path.Combine(backupPath, "continuity-journal.json");
         var backupDirectory = System.IO.Path.Combine(backupPath, "continuity");
@@ -175,6 +207,7 @@ internal static class ThreadContinuityService
                 // source session_meta ID, and the directory can contain old copies.
                 var rollouts = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
                 var archivedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var indexedOwners = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                 var activeIds = new List<string>();
                 var changedIds = new HashSet<string>(StringComparer.Ordinal);
                 var replacementPaths = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -186,6 +219,7 @@ internal static class ThreadContinuityService
                     {
                         var id = reader.GetString(0);
                         var path = reader.IsDBNull(1) ? null : NormalizePath(reader.GetString(1), codexHome);
+                        if (path is not null) indexedOwners.TryAdd(path, id);
                         // Either the archive flag or archive directory is sufficient.
                         // Some older records can disagree after moves/restores.
                         if (reader.GetInt64(2) != 0 || (path is not null && IsArchivedPath(codexHome, path)))
@@ -231,6 +265,23 @@ internal static class ThreadContinuityService
                     EnsureLocalRollout(codexHome, path);
                     if (!path.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase))
                         throw new IOException($"Unsupported rollout format: {path}. No switch was applied.");
+                    if (canonicalId is not null)
+                    {
+                        var physicalId = ReadPhysicalRolloutId(path, canonicalId);
+                        var patch = physicalId is null ? null
+                            : FixedWidthRoutingService.TryPrepare(path, canonicalId, provider, backupDirectory);
+                        if (patch is not null)
+                        {
+                            patches.Add(patch);
+                            continue;
+                        }
+                        var reusable = FindReusableGeneration(codexHome, path, canonicalId, provider, archivedPaths, indexedOwners);
+                        if (reusable is not null)
+                        {
+                            replacementPaths.Add(canonicalId, reusable);
+                            continue;
+                        }
+                    }
                     var staged = System.IO.Path.Combine(backupDirectory, Guid.NewGuid().ToString("N") + ".switchtmp");
                     try
                     {
@@ -243,6 +294,7 @@ internal static class ThreadContinuityService
                         if (change.Offsets.Count == 0) continue;
                         if (change.IsPaginated)
                         {
+                            FixedWidthRoutingService.ReserveHeaderSpace(staged, provider);
                             // A new immutable rollout generation preserves every old
                             // cache and history_base reference, including archives.
                             var logicalId = Guid.Parse(canonicalId!).ToString();
@@ -250,7 +302,9 @@ internal static class ThreadContinuityService
                             var name = $"rollout-{timestamp}-{logicalId}_{Guid.NewGuid()}.jsonl";
                             var replacement = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(path)!, name);
                             if (File.Exists(replacement)) throw new IOException("The replacement rollout already exists.");
-                            files.Add(new FileChange(replacement, staged, path, false));
+                            using var prepared = File.OpenRead(staged);
+                            files.Add(new FileChange(replacement, staged, path, false,
+                                prepared.Length, Convert.ToHexString(SHA256.HashData(prepared))));
                             replacementPaths.Add(canonicalId!, replacement);
                             continue;
                         }
@@ -293,11 +347,16 @@ internal static class ThreadContinuityService
                         var value = query.ExecuteScalar();
                         if (value is not null)
                         {
-                            BackupDatabase(history);
-                            using var update = Command(history, "UPDATE thread_history_projection_state SET next_rollout_byte_offset = $offset WHERE thread_id = $id");
-                            update.Parameters.AddWithValue("$id", change.Id);
-                            update.Parameters.AddWithValue("$offset", ShiftOffset(change, Convert.ToInt64(value)));
-                            update.ExecuteNonQuery();
+                            var originalOffset = Convert.ToInt64(value);
+                            var nextOffset = ShiftOffset(change, originalOffset);
+                            if (nextOffset != originalOffset)
+                            {
+                                BackupDatabase(history);
+                                using var update = Command(history, "UPDATE thread_history_projection_state SET next_rollout_byte_offset = $offset WHERE thread_id = $id");
+                                update.Parameters.AddWithValue("$id", change.Id);
+                                update.Parameters.AddWithValue("$offset", nextOffset);
+                                update.ExecuteNonQuery();
+                            }
                         }
                         foreach (var column in new[] { "rollout_byte_offset", "rollout_end_byte_offset" })
                         {
@@ -307,7 +366,12 @@ internal static class ThreadContinuityService
                             {
                                 turns.Parameters.AddWithValue("$id", change.Id);
                                 using var reader = turns.ExecuteReader();
-                                while (reader.Read()) offsets.Add((reader.GetString(0), ShiftOffset(change, reader.GetInt64(1))));
+                                while (reader.Read())
+                                {
+                                    var originalOffset = reader.GetInt64(1);
+                                    var nextOffset = ShiftOffset(change, originalOffset);
+                                    if (nextOffset != originalOffset) offsets.Add((reader.GetString(0), nextOffset));
+                                }
                             }
                             foreach (var (turnId, offset) in offsets)
                             {
@@ -327,6 +391,13 @@ internal static class ThreadContinuityService
             StageText(System.IO.Path.Combine(codexHome, "auth.json"), authText, backupDirectory, files);
             beforeApply?.Invoke();
             WriteJournal("applying");
+            foreach (var patch in patches)
+            {
+                // A patch may fail after writing only part of its header/tail.
+                // Include it in recovery before its first write.
+                appliedPatches.Add(patch);
+                FixedWidthRoutingService.Apply(patch);
+            }
             foreach (var file in files)
             {
                 File.Move(file.Staged, file.Path, overwrite: true);
@@ -367,8 +438,17 @@ internal static class ThreadContinuityService
                         try { File.Copy(file.Backup, temporary); File.Move(temporary, file.Path, true); }
                         finally { File.Delete(temporary); }
                     }
-                    else File.Delete(file.Path);
+                    else
+                    {
+                        ValidateNewGeneration(file.Path, file.ExpectedLength, file.ExpectedHash);
+                        File.Delete(file.Path);
+                    }
                 }
+                catch (Exception restoreError) { errors.Add(restoreError); }
+            }
+            foreach (var patch in appliedPatches.AsEnumerable().Reverse())
+            {
+                try { FixedWidthRoutingService.Restore(patch); }
                 catch (Exception restoreError) { errors.Add(restoreError); }
             }
             if (File.Exists(journalPath))
@@ -393,10 +473,34 @@ internal static class ThreadContinuityService
         void WriteJournal(string status) => TextFileService.WriteUtf8NoBom(journalPath, JsonSerializer.Serialize(new
         {
             status,
-            files = files.Select(file => new { target = file.Path, backup = System.IO.Path.GetRelativePath(backupPath, file.Backup), existed = file.Existed }),
+            files = files.Select(file => new
+            {
+                target = file.Path, backup = System.IO.Path.GetRelativePath(backupPath, file.Backup),
+                existed = file.Existed, expectedLength = file.ExpectedLength, expectedHash = file.ExpectedHash
+            }),
+            routingPatches = patches.Select(patch => new
+            {
+                target = patch.Path,
+                originalLength = patch.OriginalLength,
+                headerBefore = System.IO.Path.GetRelativePath(backupPath, patch.HeaderBeforePath),
+                headerAfter = System.IO.Path.GetRelativePath(backupPath, patch.HeaderAfterPath),
+                append = System.IO.Path.GetRelativePath(backupPath, patch.AppendPath),
+                headerLength = patch.HeaderLength,
+                expectedLength = patch.ExpectedLength
+            }),
             databases = databases.Where(database => File.Exists(database.Backup))
                 .Select(database => new { target = database.Path, backup = System.IO.Path.GetRelativePath(backupPath, database.Backup) })
         }, new JsonSerializerOptions { WriteIndented = true }));
+    }
+
+    private static void ValidateNewGeneration(string path, long? expectedLength, string? expectedHash)
+    {
+        // Older journals have no digest. New immutable generations are deleted
+        // during recovery only while still identical to their prepared content.
+        if (expectedLength is null || expectedHash is null || !File.Exists(path)) return;
+        using var current = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        if (current.Length != expectedLength || Convert.ToHexString(SHA256.HashData(current)) != expectedHash)
+            throw new IOException("The new conversation generation has changed. Recovery will retain its additional content.");
     }
 
     private static string ResolveSqliteHome(string codexHome, string configText)
@@ -505,7 +609,7 @@ internal static class ThreadContinuityService
         {
             var current = File.ReadAllText(path);
             if (System.IO.Path.GetExtension(path) == ".toml" ? TomlOverlayService.Equivalent(current, text)
-                : JsonNode.DeepEquals(JsonNode.Parse(current), JsonNode.Parse(text))) return;
+                : AuthComparisonService.Equivalent(current, text)) return;
         }
         var staged = System.IO.Path.Combine(backups, Guid.NewGuid().ToString("N") + ".switchtmp");
         var backup = System.IO.Path.Combine(backups, System.IO.Path.GetFileName(path));
@@ -530,6 +634,111 @@ internal static class ThreadContinuityService
     private static bool IsArchivedPath(string codexHome, string path) =>
         System.IO.Path.GetRelativePath(codexHome, path).StartsWith(
             "archived_sessions" + System.IO.Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+
+    private static string? FindReusableGeneration(string codexHome, string path, string canonicalId, string provider,
+        HashSet<string> archivedPaths, Dictionary<string, string> indexedOwners)
+    {
+        if (!Guid.TryParseExact(canonicalId, "D", out _) || !HasPaginatedHeader(path)) return null;
+        // Search only canonical files for this logical conversation. Unindexed
+        // arbitrary copies and archived generations never become a new route.
+        var candidates = Directory.EnumerateFiles(System.IO.Path.GetDirectoryName(path)!, $"rollout-*-{canonicalId}*.jsonl")
+            .Where(candidate => !string.Equals(candidate, path, StringComparison.OrdinalIgnoreCase)
+                && !archivedPaths.Contains(candidate)
+                && (!indexedOwners.TryGetValue(candidate, out var owner) || owner == canonicalId))
+            .OrderByDescending(File.GetLastWriteTimeUtc).ToArray();
+        RolloutFingerprint? desired = null;
+        foreach (var candidate in candidates)
+        {
+            try
+            {
+                EnsureLocalRollout(codexHome, candidate);
+                if (ReadPhysicalRolloutId(candidate, canonicalId) is null || !HasPaginatedHeader(candidate, provider)) continue;
+                desired ??= FingerprintRollout(path, canonicalId, provider);
+                var existing = FingerprintRollout(candidate, canonicalId, provider);
+                if (existing.HasTargetRouting && existing.Hash == desired.Hash) return candidate;
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException)
+            {
+                // A bad optional candidate cannot prevent switching an otherwise
+                // valid indexed history. The source is validated by StageRollout.
+            }
+        }
+        return null;
+    }
+
+    private static bool HasPaginatedHeader(string path, string? provider = null)
+    {
+        using var input = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        var line = ReadLines(input).FirstOrDefault();
+        if (line is null) return false;
+        var content = TrimLine(line, true);
+        using var document = JsonDocument.Parse(content);
+        var root = document.RootElement;
+        return root.TryGetProperty("type", out var type) && type.GetString() == "session_meta"
+            && root.TryGetProperty("payload", out var payload)
+            && payload.TryGetProperty("history_mode", out var mode) && mode.GetString() == "paginated"
+            && (provider is null || payload.TryGetProperty("model_provider", out var current) && current.GetString() == provider);
+    }
+
+    private static RolloutFingerprint FingerprintRollout(string path, string canonicalId, string provider)
+    {
+        // Only provider fields and routing-record formatting may differ. Every
+        // other record is hashed byte-for-byte, including ordinals/newlines.
+        // A shorter/stale conversation or different history_base cannot match.
+        using var input = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var hasTargetRouting = true;
+        var sawMeta = false;
+        var first = true;
+        Span<byte> length = stackalloc byte[8];
+        foreach (var line in ReadLines(input))
+        {
+            var content = TrimLine(line, first);
+            first = false;
+            byte[] normalized = line;
+            if (content.Length > 0)
+            {
+                using var document = JsonDocument.Parse(content);
+                var root = document.RootElement;
+                var type = root.GetProperty("type").GetString();
+                var field = type == "session_meta" ? "model_provider"
+                    : type == "event_msg" && root.GetProperty("payload").TryGetProperty("type", out var eventType)
+                        && eventType.GetString() == "thread_settings_applied" ? "model_provider_id" : null;
+                if (type == "session_meta") sawMeta = true;
+                if (field is not null)
+                {
+                    var node = JsonNode.Parse(content.Span)!;
+                    var settings = field == "model_provider" ? node["payload"]! : node["payload"]!["thread_settings"]!;
+                    hasTargetRouting &= settings[field]?.GetValue<string>() == provider;
+                    settings[field] = provider;
+                    normalized = JsonSerializer.SerializeToUtf8Bytes(SortJson(node));
+                }
+            }
+            BinaryPrimitives.WriteInt64LittleEndian(length, normalized.Length);
+            hash.AppendData(length);
+            hash.AppendData(normalized);
+        }
+        if (!sawMeta) throw new IOException("Missing session identity in reusable history.");
+        // Validate the indexed filename before treating an old cache as reusable.
+        ReadPhysicalRolloutId(path, canonicalId);
+        return new RolloutFingerprint(Convert.ToHexString(hash.GetHashAndReset()), hasTargetRouting);
+    }
+
+    private static JsonNode? SortJson(JsonNode? node) => node switch
+    {
+        JsonObject obj => new JsonObject(obj.OrderBy(pair => pair.Key, StringComparer.Ordinal)
+            .Select(pair => new KeyValuePair<string, JsonNode?>(pair.Key, SortJson(pair.Value)))),
+        JsonArray array => new JsonArray(array.Select(SortJson).ToArray()),
+        _ => node?.DeepClone()
+    };
+
+    private static ReadOnlyMemory<byte> TrimLine(byte[] line, bool first)
+    {
+        var prefix = first && line.AsSpan().StartsWith(new byte[] { 239, 187, 191 }) ? 3 : 0;
+        var end = line.Length;
+        while (end > prefix && (line[end - 1] == 10 || line[end - 1] == 13)) end--;
+        return line.AsMemory(prefix, end - prefix);
+    }
 
     private static RolloutChange? StageRollout(string path, string staged, string provider, string? canonicalId)
     {
