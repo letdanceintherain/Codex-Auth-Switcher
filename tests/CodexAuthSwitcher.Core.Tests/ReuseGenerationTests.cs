@@ -273,6 +273,10 @@ public sealed class ReuseGenerationTests : IDisposable
 
     private string CreateOriginal()
     {
+        var parentDirectory = Path.Combine(Sessions, "parents");
+        Directory.CreateDirectory(parentDirectory);
+        var parent = JsonSerializer.Serialize(new { type = "session_meta", payload = new { id = BaseId } });
+        File.WriteAllText(Path.Combine(parentDirectory, $"rollout-{BaseId}.jsonl"), parent.PadRight(999) + "\n" + new string(' ', 8998) + "\n");
         var path = Path.Combine(Sessions, $"rollout-2026-10-09T00-00-00-{LogicalId}_{PhysicalId}.jsonl");
         var header = JsonSerializer.Serialize(new
         {

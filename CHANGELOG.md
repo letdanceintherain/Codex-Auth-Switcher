@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.5.0 - 2026-11-12
+
+- Fix cross-provider encrypted reasoning replay that can cause `invalid_encrypted_content` / `Encrypted content item_id did not match the target item id`. On a real credential/endpoint/provider boundary, detach opaque reasoning from model replay while retaining visible summaries, messages, tool calls/results, identities, ordinals and byte boundaries.
+- Add **Repair chats / 修复续聊** for histories already switched by an older version. Keep the current account/configuration, bypass the already-active shortcut, and avoid creating another recovery point when nothing needs repair.
+- Follow indexed active histories and inherited byte prefixes, including Zstandard-compressed parents/current histories. Skip unrelated copies and archive roots; report missing/ambiguous/archived dependencies before applying changes. Reasoning repair supports compressed files; provider routing retains its existing format restrictions.
+- Keep compressed recovery data for changed reasoning records only, within the single latest recovery point. Recover interrupted/partial repairs without truncating new messages; detect locked replacement targets before changing histories.
+- Preserve opaque compaction, encrypted messages and encrypted tool records because they may contain irreplaceable context. This repair targets encrypted reasoning, not every possible provider-specific opaque format.
+- Verify with unit/regression tests and real Codex 0.167.0-alpha.4.1 using synthetic credentials and loopback Responses: reproduce rejection, complete repaired turns in an original conversation and native fork, preserve tool context, verify repeated repair is a no-op, and detach newly generated reasoning on a normal switch.
+
 ## 1.4.0 - 2026-10-09
 
 - Stop making full paginated conversation copies on routine provider switches. Rewrite the first routing header at exactly its existing byte length and append a complete native settings event, preserving every existing message, ordinal, and inherited-history byte boundary.

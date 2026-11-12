@@ -61,7 +61,8 @@ public sealed class MainWindowViewModel : ViewModelBase
         NewApiProfileCommand = new AsyncRelayCommand(CreateApiProfileAsync, () => !IsBusy);
         EditSelectedProfileCommand = new AsyncRelayCommand(EditSelectedProfileAsync, () => !IsBusy && SelectedProfile?.Summary.Kind == ProfileKind.ApiKey);
         DeleteSelectedProfileCommand = new AsyncRelayCommand(DeleteSelectedProfileAsync, () => !IsBusy && SelectedProfile is not null);
-        SwitchSelectedProfileCommand = new AsyncRelayCommand(SwitchSelectedProfileAsync, () => !IsBusy && SelectedProfile is not null);
+        SwitchSelectedProfileCommand = new AsyncRelayCommand(() => SwitchSelectedProfileAsync(), () => !IsBusy && SelectedProfile is not null);
+        RepairHistoryCommand = new AsyncRelayCommand(() => SwitchSelectedProfileAsync(repair: true), () => !IsBusy);
         SetChineseCommand = new RelayCommand(() => SetLanguage(AppLanguage.ZhCn), () => !_localizationService.IsChineseSelected);
         SetEnglishCommand = new RelayCommand(() => SetLanguage(AppLanguage.EnUs), () => !_localizationService.IsEnglishSelected);
 
@@ -75,6 +76,7 @@ public sealed class MainWindowViewModel : ViewModelBase
     public AsyncRelayCommand EditSelectedProfileCommand { get; }
     public AsyncRelayCommand DeleteSelectedProfileCommand { get; }
     public AsyncRelayCommand SwitchSelectedProfileCommand { get; }
+    public AsyncRelayCommand RepairHistoryCommand { get; }
     public RelayCommand SetChineseCommand { get; }
     public RelayCommand SetEnglishCommand { get; }
 
@@ -329,15 +331,15 @@ public sealed class MainWindowViewModel : ViewModelBase
         SetStatus("Status.DeletedProfile", targetName);
     }
 
-    private async Task SwitchSelectedProfileAsync()
+    private async Task SwitchSelectedProfileAsync(bool repair = false)
     {
-        if (SelectedProfile is null)
+        if (!repair && SelectedProfile is null)
         {
             return;
         }
 
-        var profileName = SelectedProfile.Name;
-        var alreadyActive = await RunBusyAsync(() => Task.Run<bool?>(() => _switcherService.IsProfileActive(profileName)));
+        var profileName = SelectedProfile?.Name ?? string.Empty;
+        var alreadyActive = repair ? false : await RunBusyAsync(() => Task.Run<bool?>(() => _switcherService.IsProfileActive(profileName)));
         if (alreadyActive is null) return;
         if (alreadyActive == true)
         {
@@ -381,7 +383,7 @@ public sealed class MainWindowViewModel : ViewModelBase
 
         var result = await RunBusyAsync(() => Task.Run(() =>
         {
-            var switchResult = _switcherService.SwitchProfile(profileName);
+            var switchResult = repair ? _switcherService.RepairConversationHistory() : _switcherService.SwitchProfile(profileName);
             var restartMethod = switchResult.RestartRequired || processState.IsRunning
                 ? _desktopProcessService.RestartDesktopApp(_desktopAppPath) : RestartMethod.None;
             return new SwitchExecutionResult
@@ -398,7 +400,7 @@ public sealed class MainWindowViewModel : ViewModelBase
         if (result.SwitchResult.AlreadyActive && !processState.IsRunning)
         {
             SwitchDetails = string.Empty;
-            SetStatus("Status.AlreadyActive", profileName);
+            SetStatus(repair ? "Status.RepairNotNeeded" : "Status.AlreadyActive", profileName);
             return;
         }
 
@@ -410,6 +412,14 @@ public sealed class MainWindowViewModel : ViewModelBase
         }
 
         await RefreshAsync();
+        if (repair)
+        {
+            SwitchDetails = string.IsNullOrEmpty(result.SwitchResult.BackupPath) ? string.Empty : result.SwitchResult.BackupPath;
+            SetStatus(result.SwitchResult.AlreadyActive ? "Status.RepairNotNeeded"
+                    : result.RestartMethod == RestartMethod.None ? "Status.RepairedRestartFailed" : "Status.Repaired",
+                result.SwitchResult.SynchronizedThreads);
+            return;
+        }
         SwitchDetails = string.IsNullOrEmpty(result.SwitchResult.BackupPath) ? string.Empty
             : _localizationService.Format("Status.SwitchDetails", result.SwitchResult.SynchronizedThreads, result.SwitchResult.BackupPath);
         if (result.RestartMethod == RestartMethod.None)
@@ -620,6 +630,7 @@ public sealed class MainWindowViewModel : ViewModelBase
         EditSelectedProfileCommand.RaiseCanExecuteChanged();
         DeleteSelectedProfileCommand.RaiseCanExecuteChanged();
         SwitchSelectedProfileCommand.RaiseCanExecuteChanged();
+        RepairHistoryCommand.RaiseCanExecuteChanged();
         SetChineseCommand.RaiseCanExecuteChanged();
         SetEnglishCommand.RaiseCanExecuteChanged();
     }

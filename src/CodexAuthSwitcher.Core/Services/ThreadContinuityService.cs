@@ -9,7 +9,8 @@ using Microsoft.Data.Sqlite;
 namespace CodexAuthSwitcher.Core.Services;
 
 /// <summary>
-/// Changes routing metadata, never conversation content or thread identity.
+/// Changes routing and optionally detaches opaque reasoning from cross-account replay.
+/// Never changes visible messages, tool records or thread identity.
 /// Call only after Codex has exited. All databases are backed up through SQLite
 /// (including WAL data). Paginated routing keeps byte boundaries stable and
 /// records only its original header and append operation for recovery.
@@ -98,6 +99,11 @@ internal static class ThreadContinuityService
             NormalizePath(node["append"]!.GetValue<string>(), backupPath),
             node["headerLength"]!.GetValue<int>(),
             node["expectedLength"]!.GetValue<long>())).ToList() ?? [];
+        var reasoningPatches = journal["reasoningPatches"]?.AsArray().Select(node => new ReasoningPatch(
+            NormalizePath(node!["target"]!.GetValue<string>(), codexHome),
+            node["originalLength"]!.GetValue<long>(),
+            NormalizePath(node["recovery"]!.GetValue<string>(), backupPath),
+            node["recordCount"]!.GetValue<int>())).ToList() ?? [];
         var configBackup = files.FirstOrDefault(file => string.Equals(file.Target, configPath, StringComparison.OrdinalIgnoreCase));
         var config = File.ReadAllText(configBackup.Existed ? configBackup.Backup : configPath);
         var sqliteHome = ResolveSqliteHome(codexHome, config);
@@ -138,10 +144,19 @@ internal static class ThreadContinuityService
             ValidateRecoverySource(patch.HeaderAfterPath, backupPath);
             ValidateRecoverySource(patch.AppendPath, backupPath);
         }
+        foreach (var patch in reasoningPatches)
+        {
+            EnsureLocalRollout(codexHome, patch.Path);
+            if (!patch.Path.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase)
+                && !patch.Path.EndsWith(".jsonl.zst", StringComparison.OrdinalIgnoreCase))
+                throw new IOException("Invalid reasoning recovery target.");
+            ValidateRecoverySource(patch.RecoveryPath, backupPath);
+        }
         beforeRestore();
         // Stop Codex before inspecting live patch state: a normal exit can
         // flush final records. Reject additional content before restoring DBs.
         foreach (var patch in patches) FixedWidthRoutingService.ValidateRestore(patch);
+        foreach (var patch in reasoningPatches) ReasoningCompatibilityService.ValidateRestore(patch);
         foreach (var file in files.Where(file => !file.Existed))
             ValidateNewGeneration(file.Target, file.ExpectedLength, file.ExpectedHash);
         foreach (var database in databases)
@@ -158,6 +173,7 @@ internal static class ThreadContinuityService
             File.Move(staged, file.Target, overwrite: true);
         }
         foreach (var patch in patches.AsEnumerable().Reverse()) FixedWidthRoutingService.Restore(patch);
+        foreach (var patch in reasoningPatches.AsEnumerable().Reverse()) ReasoningCompatibilityService.Restore(patch);
         journal["status"] = "rolled-back";
         TextFileService.WriteUtf8NoBom(journalPath, journal.ToJsonString());
         return "rolled-back";
@@ -172,7 +188,7 @@ internal static class ThreadContinuityService
     }
 
     public static int Switch(string codexHome, string configText, string authText, string backupPath,
-        Action? beforeApply = null, bool synchronizeThreads = true)
+        Action? beforeApply = null, bool synchronizeThreads = true, bool detachEncryptedReasoning = false)
     {
         codexHome = NormalizePath(codexHome, Environment.CurrentDirectory);
         var provider = TomlOverlayService.TryReadScalar(configText, "model_provider") ?? "openai";
@@ -184,6 +200,8 @@ internal static class ThreadContinuityService
         var applied = new List<FileChange>();
         var patches = new List<RoutingPatch>();
         var appliedPatches = new List<RoutingPatch>();
+        var reasoningPatches = new List<ReasoningPatch>();
+        var appliedReasoningPatches = new List<ReasoningPatch>();
         var rolloutChanges = new List<RolloutChange>();
         var journalPath = System.IO.Path.Combine(backupPath, "continuity-journal.json");
         var backupDirectory = System.IO.Path.Combine(backupPath, "continuity");
@@ -191,6 +209,9 @@ internal static class ThreadContinuityService
         var changedThreads = 0;
         try
         {
+            if (detachEncryptedReasoning)
+                reasoningPatches = ReasoningCompatibilityService.Prepare(
+                    FindReasoningHistory(codexHome, sqliteHome), backupDirectory);
             if (synchronizeThreads)
             {
                 var statePath = System.IO.Path.Combine(sqliteHome, "state_5.sqlite");
@@ -275,7 +296,8 @@ internal static class ThreadContinuityService
                             patches.Add(patch);
                             continue;
                         }
-                        var reusable = FindReusableGeneration(codexHome, path, canonicalId, provider, archivedPaths, indexedOwners);
+                        var reusable = reasoningPatches.Any(item => string.Equals(item.Path, path, StringComparison.OrdinalIgnoreCase)) ? null
+                            : FindReusableGeneration(codexHome, path, canonicalId, provider, archivedPaths, indexedOwners);
                         if (reusable is not null)
                         {
                             replacementPaths.Add(canonicalId, reusable);
@@ -285,7 +307,7 @@ internal static class ThreadContinuityService
                     var staged = System.IO.Path.Combine(backupDirectory, Guid.NewGuid().ToString("N") + ".switchtmp");
                     try
                     {
-                        var change = StageRollout(path, staged, provider, canonicalId);
+                        var change = StageRollout(path, staged, provider, canonicalId, detachEncryptedReasoning);
                         if (change is null) continue;
                         // An unchanged duplicate is still ambiguous: never bind a
                         // changed copy to a cache owned by another physical file.
@@ -387,10 +409,30 @@ internal static class ThreadContinuityService
                 }
             }
 
+            // Legacy replacements already contain detached records and carry a
+            // whole-file rollback. Do not also journal sparse offsets from their
+            // old layout: routing may move those offsets in the replacement.
+            foreach (var patch in reasoningPatches.Where(patch => files.Any(file => file.Existed
+                         && string.Equals(file.Path, patch.Path, StringComparison.OrdinalIgnoreCase))).ToArray())
+            {
+                File.Delete(patch.RecoveryPath);
+                reasoningPatches.Remove(patch);
+            }
             StageText(System.IO.Path.Combine(codexHome, "config.toml"), configText, backupDirectory, files);
             StageText(System.IO.Path.Combine(codexHome, "auth.json"), authText, backupDirectory, files);
+            if (files.Count == 0 && patches.Count == 0 && reasoningPatches.Count == 0 && changedThreads == 0)
+                return 0;
             beforeApply?.Invoke();
             WriteJournal("applying");
+            // On Windows, replacing a file with an outstanding read handle can
+            // stall inside MoveFileEx. Detect that before changing any histories.
+            foreach (var file in files.Where(file => file.Existed))
+                using (File.Open(file.Path, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) { }
+            foreach (var patch in reasoningPatches)
+            {
+                appliedReasoningPatches.Add(patch);
+                ReasoningCompatibilityService.Apply(patch);
+            }
             foreach (var patch in patches)
             {
                 // A patch may fail after writing only part of its header/tail.
@@ -409,7 +451,7 @@ internal static class ThreadContinuityService
                 database.Committed = File.Exists(database.Backup);
             }
             WriteJournal("complete");
-            return Math.Max(changedThreads, rolloutChanges.Count);
+            return Math.Max(Math.Max(changedThreads, rolloutChanges.Count), reasoningPatches.Count);
         }
         catch (Exception error)
         {
@@ -451,6 +493,11 @@ internal static class ThreadContinuityService
                 try { FixedWidthRoutingService.Restore(patch); }
                 catch (Exception restoreError) { errors.Add(restoreError); }
             }
+            foreach (var patch in appliedReasoningPatches.AsEnumerable().Reverse())
+            {
+                try { ReasoningCompatibilityService.Restore(patch); }
+                catch (Exception restoreError) { errors.Add(restoreError); }
+            }
             if (File.Exists(journalPath))
             {
                 try { WriteJournal(errors.Count == 1 ? "rolled-back" : "recovery-required"); }
@@ -473,6 +520,11 @@ internal static class ThreadContinuityService
         void WriteJournal(string status) => TextFileService.WriteUtf8NoBom(journalPath, JsonSerializer.Serialize(new
         {
             status,
+            reasoningPatches = reasoningPatches.Select(patch => new
+            {
+                target = patch.Path, originalLength = patch.OriginalLength,
+                recovery = System.IO.Path.GetRelativePath(backupPath, patch.RecoveryPath), recordCount = patch.RecordCount
+            }),
             files = files.Select(file => new
             {
                 target = file.Path, backup = System.IO.Path.GetRelativePath(backupPath, file.Backup),
@@ -509,6 +561,68 @@ internal static class ThreadContinuityService
         if (!string.IsNullOrWhiteSpace(configured)) return NormalizePath(configured, codexHome);
         var fromEnvironment = Environment.GetEnvironmentVariable("CODEX_SQLITE_HOME");
         return string.IsNullOrWhiteSpace(fromEnvironment) ? codexHome : NormalizePath(fromEnvironment, Environment.CurrentDirectory);
+    }
+
+    private static Dictionary<string, long> FindReasoningHistory(string codexHome, string sqliteHome)
+    {
+        ValidateDatabaseVersion(sqliteHome);
+        var sessions = System.IO.Path.Combine(codexHome, "sessions");
+        var result = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        if (!Directory.Exists(sessions)) return result;
+        var options = new EnumerationOptions { RecurseSubdirectories = true, AttributesToSkip = FileAttributes.ReparsePoint };
+        var allFiles = Directory.EnumerateFiles(sessions, "*.jsonl*", options)
+            .Where(path => path.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase)
+                || path.EndsWith(".jsonl.zst", StringComparison.OrdinalIgnoreCase)).ToArray();
+        var statePath = System.IO.Path.Combine(sqliteHome, "state_5.sqlite");
+        var roots = new List<string>();
+        var archived = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (File.Exists(statePath))
+        {
+            using var connection = OpenConnection(statePath, SqliteOpenMode.ReadOnly);
+            using var query = connection.CreateCommand();
+            query.CommandText = "SELECT rollout_path, archived FROM threads WHERE rollout_path IS NOT NULL";
+            using var reader = query.ExecuteReader();
+            while (reader.Read())
+            {
+                var path = NormalizePath(reader.GetString(0), codexHome);
+                if (!File.Exists(path) && File.Exists(path + ".zst")) path += ".zst";
+                if (reader.GetInt64(1) != 0 || IsArchivedPath(codexHome, path)) { archived.Add(path); continue; }
+                if (File.Exists(path)) roots.Add(path);
+            }
+        }
+        else roots.AddRange(allFiles);
+        foreach (var root in roots) Visit(root, long.MaxValue, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+        return result;
+
+        void Visit(string path, long limit, HashSet<string> ancestors)
+        {
+            EnsureLocalRollout(codexHome, path);
+            if (archived.Contains(path))
+                throw new IOException("An active conversation inherits an archived history. Unarchive its source before repairing; archives were not modified.");
+            if (!ancestors.Add(path)) throw new IOException("Conversation history inheritance contains a cycle.");
+            if (result.TryGetValue(path, out var previous) && previous >= limit) { ancestors.Remove(path); return; }
+            result[path] = limit;
+            using var input = ReasoningCompatibilityService.OpenDecoded(path);
+            var line = ReasoningCompatibilityService.ReadLines(input).FirstOrDefault();
+            if (line is null) throw new IOException("Conversation metadata is missing.");
+            using var document = JsonDocument.Parse(TrimLine(line, first: true));
+            var metadata = document.RootElement.GetProperty("payload");
+            if (metadata.TryGetProperty("history_base", out var historyBase) && historyBase.ValueKind == JsonValueKind.Object)
+            {
+                var id = historyBase.GetProperty("thread_id").GetString();
+                if (!Guid.TryParseExact(id, "D", out _)) throw new IOException("Invalid inherited history identity.");
+                var matches = allFiles.Where(candidate => candidate.EndsWith("_" + id + ".jsonl", StringComparison.OrdinalIgnoreCase)
+                    || candidate.EndsWith("-" + id + ".jsonl", StringComparison.OrdinalIgnoreCase)
+                    || candidate.EndsWith("_" + id + ".jsonl.zst", StringComparison.OrdinalIgnoreCase)
+                    || candidate.EndsWith("-" + id + ".jsonl.zst", StringComparison.OrdinalIgnoreCase)).ToArray();
+                if (matches.Length != 1)
+                    throw new IOException($"Inherited history {id} is missing, archived or ambiguous. No repair was applied.");
+                var boundary = historyBase.GetProperty("end_byte_offset").GetInt64();
+                if (boundary <= 0) throw new IOException("Invalid inherited history byte boundary.");
+                Visit(matches[0], boundary, ancestors);
+            }
+            ancestors.Remove(path);
+        }
     }
 
     private static string NormalizePath(string path, string basePath)
@@ -740,7 +854,8 @@ internal static class ThreadContinuityService
         return line.AsMemory(prefix, end - prefix);
     }
 
-    private static RolloutChange? StageRollout(string path, string staged, string provider, string? canonicalId)
+    private static RolloutChange? StageRollout(string path, string staged, string provider, string? canonicalId,
+        bool detachEncryptedReasoning = false)
     {
         using var input = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read);
         using var output = File.Create(staged);
@@ -783,7 +898,7 @@ internal static class ThreadContinuityService
                 && root.GetProperty("payload").TryGetProperty("type", out var eventType)
                 && eventType.GetString() == "thread_settings_applied")
                 field = "model_provider_id";
-            var updated = line;
+            var updated = detachEncryptedReasoning ? ReasoningCompatibilityService.DetachRecord(line) ?? line : line;
             if (field is not null)
             {
                 var payload = root.GetProperty("payload");

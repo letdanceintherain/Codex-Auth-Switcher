@@ -334,6 +334,8 @@ public sealed class ThreadContinuityTests : IDisposable
         CreateDatabases();
         var initial = CreateRollout(logicalId, "crs", false, "\n", false);
         var directory = Path.GetDirectoryName(initial)!;
+        var sourceHeader = JsonSerializer.Serialize(new { type = "session_meta", payload = new { id = sourceId } });
+        File.WriteAllText(Path.Combine(directory, $"rollout-{sourceId}.jsonl"), sourceHeader.PadRight(9999) + "\n");
         var canonical = Path.Combine(directory, $"rollout-2026-09-15T00-00-00-{logicalId}_{physicalId}.jsonl");
         File.Move(initial, canonical);
         var lines = File.ReadAllLines(canonical).Select(line => JsonNode.Parse(line)!).ToList();
@@ -727,7 +729,7 @@ public sealed class ThreadContinuityTests : IDisposable
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public void SameProvider_ChangesOnlyCredentialsOrSettingsWithoutTouchingHistory(bool changeSettings)
+    public void SameProvider_ChangingCredentialsOrEndpointChecksButDoesNotWritePlainHistory(bool changeSettings)
     {
         CreateDatabases();
         var path = CreateRollout("first", "openai", false, "\n", false);
@@ -738,7 +740,7 @@ public sealed class ThreadContinuityTests : IDisposable
         if (changeSettings) { spec.Model = "different-model"; spec.BaseUrl = "https://different.example/v1"; }
         else spec.ApiKey = "different-key";
         _service.SaveApiProfile(spec);
-        using (var rolloutLock = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.None))
+        using (var rolloutLock = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read))
         using (var databaseLock = File.Open(HistoryPath, FileMode.Open, FileAccess.Read, FileShare.None))
         using (var state = Open(StatePath))
         using (var transaction = state.BeginTransaction())
@@ -754,11 +756,11 @@ public sealed class ThreadContinuityTests : IDisposable
     }
 
     [Fact]
-    public void SwitchingChatGptAccounts_DoesNotBackUpOrReadUnchangedHistories()
+    public void SwitchingChatGptAccounts_DoesNotBackUpOrWritePlainHistories()
     {
         CreateDatabases();
         var path = CreateRollout("first", "openai", false, "\n", false);
-        using var rolloutLock = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.None);
+        using var rolloutLock = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read);
         var result = _service.SwitchProfile("account-a");
         Assert.Equal(0, result.SynchronizedThreads);
         Assert.Equal("auth.json", Path.GetFileName(Assert.Single(Directory.GetFiles(Path.Combine(result.BackupPath, "continuity")))));
@@ -813,7 +815,7 @@ public sealed class ThreadContinuityTests : IDisposable
         var matching = CreateRollout("matching", "my-provider", false, "\n", false);
         var changing = CreateRollout("changing", "openai", false, "\n", false);
         File.WriteAllText(Path.Combine(_root, "sessions", "unreferenced.jsonl"), "invalid unused history");
-        using var rolloutLock = File.Open(matching, FileMode.Open, FileAccess.Read, FileShare.None);
+        using var rolloutLock = File.Open(matching, FileMode.Open, FileAccess.Read, FileShare.Read);
         var result = _service.SwitchProfile("api-a");
         Assert.Equal(1, result.SynchronizedThreads);
         AssertProvider(changing, "my-provider");

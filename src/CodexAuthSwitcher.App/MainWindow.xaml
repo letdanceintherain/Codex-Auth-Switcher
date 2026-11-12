@@ -370,6 +370,10 @@
                         <Button Style="{StaticResource PrimaryButtonStyle}"
                                 Command="{Binding SwitchSelectedProfileCommand}"
                                 Content="{Binding Source={x:Static app:App.Localization}, Path=[Common.SwitchToSelected]}" />
+                        <Button Style="{StaticResource ActionButtonStyle}"
+                                Command="{Binding RepairHistoryCommand}"
+                                ToolTip="{Binding Source={x:Static app:App.Localization}, Path=[Common.RepairHistoryHint]}"
+                                Content="{Binding Source={x:Static app:App.Localization}, Path=[Common.RepairHistory]}" />
                     </StackPanel>
                 </Grid>
             </Border>

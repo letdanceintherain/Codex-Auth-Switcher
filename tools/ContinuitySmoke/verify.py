@@ -60,7 +60,11 @@ class Server:
                 self.queue.put(json.loads(line))
         threading.Thread(target=read, daemon=True).start()
         self.serial = 0
-        self.rpc('initialize', {'clientInfo': {'name': 'switcher_isolated_test', 'version':'1.0'}, 'capabilities': {'experimentalApi': True}})
+        try:
+            self.rpc('initialize', {'clientInfo': {'name': 'switcher_isolated_test', 'version':'1.0'}, 'capabilities': {'experimentalApi': True}})
+        except BaseException:
+            self.__exit__()
+            raise
         self.send({'method':'initialized'})
         return self
     def send(self, value):
@@ -70,7 +74,7 @@ class Server:
         self.serial += 1
         serial = self.serial
         self.send({'id':serial,'method':method,'params':params})
-        deadline = time.monotonic()+35
+        deadline = time.monotonic()+float(os.environ.get('SWITCHER_SMOKE_RPC_TIMEOUT', '35'))
         while time.monotonic()<deadline:
             response = self.queue.get(timeout=max(0.1,deadline-time.monotonic()))
             if response.get('id') == serial:

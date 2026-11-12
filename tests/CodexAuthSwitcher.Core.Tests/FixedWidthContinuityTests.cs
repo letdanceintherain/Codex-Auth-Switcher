@@ -205,6 +205,11 @@ public sealed class FixedWidthContinuityTests : IDisposable
 
     private string CreateRollout(bool padded, string newline = "\n", bool bom = false)
     {
+        // Compatibility traversal now resolves inherited history, not just routing.
+        var parentDirectory = Path.Combine(SessionsPath, "parents");
+        Directory.CreateDirectory(parentDirectory);
+        var parent = JsonSerializer.Serialize(new { type = "session_meta", payload = new { id = SourceId } });
+        File.WriteAllText(Path.Combine(parentDirectory, $"rollout-{SourceId}.jsonl"), parent.PadRight(12344) + "\n");
         var path = Path.Combine(SessionsPath, $"rollout-2026-10-09T00-00-00-{ThreadId}.jsonl");
         var header = JsonSerializer.Serialize(new
         {

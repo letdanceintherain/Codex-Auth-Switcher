@@ -11,7 +11,15 @@ A Windows app for switching ChatGPT accounts and API profiles while continuing t
 
 Use the installer for normal use, or run the portable executable directly. Windows x64; the release includes the .NET runtime.
 
-## What changed in v1.4.0
+## What changed in v1.5.0
+
+Fixes encrypted **reasoning** replay after switching providers/accounts, including `Encrypted content item_id did not match the target item id`. Real credential/endpoint/provider changes detach old opaque reasoning from the next model request. Visible messages, tool calls/results, thread IDs and byte boundaries remain intact; hidden reasoning state is intentionally reset at these boundaries. Token refresh for the same trusted account and model-only changes do not trigger this reset.
+
+For an already-broken conversation, finish running tasks and click **Repair chats**. Codex must close first. Repair keeps your current account and configuration; retry in the original conversation after Codex restarts. Repeating repair with nothing new to detach does not create a new recovery point.
+
+Repair follows active histories and inherited prefixes, including `.jsonl.zst`. Recovery stores compressed changed records, not full conversation copies. Archives and unrelated copies are not processed. Missing, ambiguous or archived dependencies produce an error before changes. Opaque compaction and encrypted message/tool content are deliberately preserved because discarding them could lose actual context; those separate formats still depend on provider compatibility.
+
+### Routing improvements retained from v1.4.0
 
 Routine provider switches no longer make a full copy of each current paginated conversation. The app updates a fixed-size routing header and appends a native settings event. Existing message bytes, ordinal positions and inherited-history boundaries remain stable, including when Codex has added settings or new messages since the last switch.
 
@@ -22,8 +30,8 @@ API authentication comparisons now ignore incidental fields when the same key an
 Switching now does only the work needed for the selected profile:
 
 - Selecting an already active profile does not rewrite files, create a backup, or close/restart Codex. TOML/JSON formatting differences do not count as changes.
-- Changing a key, account, endpoint or model leaves conversation files and databases alone when their provider routing already matches. A read-only index query still detects newly unarchived conversations that need synchronization.
-- Only indexed, unarchived conversations with a different provider are synchronized. Archives, matching conversations and unindexed copies are skipped.
+- Model-only changes leave conversation histories alone. Credential/endpoint/provider changes also check encrypted reasoning, even when the provider ID matches; databases are still unchanged when routing matches.
+- Routing synchronization selects indexed, unarchived conversations with a different provider. Reasoning checks additionally follow required ancestors. Archives and unrelated copies are skipped.
 - New switches retain one recovery point at `auth-switcher/backups/latest`. Configuration and authentication are each copied at most once, and only if changed. Databases are backed up only before a required database update.
 - An interrupted operation is recovered automatically with Codex closed when its journal and recovery sources are usable. Existing backups from older versions are checked once on upgrade and left in place.
 - Normal status messages focus on continuing conversations. Recovery paths and synchronization counts are available under Details. Closing Codex now waits for a normal exit; a timeout asks for manual closure instead of killing the process.
@@ -32,7 +40,7 @@ Switching now does only the work needed for the selected profile:
 
 The switcher now follows SQLite's selected history path instead of scanning every active copy. A reverted thread can have many files sharing the same logical ID; those are not necessarily duplicates and are no longer rejected just because their first metadata IDs match.
 
-Compatible paginated histories keep the same physical file on provider changes. The first routing record keeps its exact byte length, all old records after it stay byte-identical, and a new complete settings event selects the provider. If a new generation is needed to reserve header space or handle an unsupported layout, Codex materializes its cache when the conversation resumes; a read before that first resume can return an empty turn list. Resume restores the full history from the rollout. The logical conversation ID remains the same. Unindexed copies and archives are not deleted or rewritten.
+Compatible paginated histories keep the same physical file on provider changes. Routing headers and detached reasoning records keep their exact byte lengths; message/tool records stay byte-identical, and a new complete settings event selects the provider. If a new generation is needed to reserve header space or handle an unsupported layout, Codex materializes its cache on resume; a read before that first resume can return an empty turn list. The logical conversation ID remains the same. Required inherited-history prefixes may be repaired, but unrelated copies and archives are not rewritten.
 
 Archived conversations are now skipped. Duplicate IDs, invalid JSONL, or compressed files inside `archived_sessions` no longer block an ordinary switch. Archive files, archived thread rows, and their cache offsets remain unchanged. To continue an archived conversation on a new provider later, unarchive it in Codex and switch again.
 
@@ -67,7 +75,7 @@ It updates:
 
 Message records are preserved byte-for-byte. History-cache messages/turns, `session_index.jsonl`, and desktop global/sidebar state are not rewritten. TOML changes preserve unrelated settings, multiline instructions, comments, and custom provider headers.
 
-The latest completed switch has one recovery point at `CODEX_HOME/auth-switcher/backups/latest`. It contains only changed files/databases and small routing recovery records for fixed-width updates, rather than whole paginated chat backups. SQLite snapshots include uncheckpointed WAL data. A credential-only change backs up only `auth.json`; it does not create database or conversation backups.
+The latest completed switch/repair has one recovery point at `CODEX_HOME/auth-switcher/backups/latest`. It contains changed files/databases, small routing recovery records and compressed changed reasoning records, rather than whole paginated chat backups. SQLite snapshots include uncheckpointed WAL data. A credential-only change also records reasoning changes if necessary, but does not create database backups when routing is unchanged. Compressed histories are recompressed using a temporary replacement; uncompressed byte boundaries remain stable.
 
 During a switch, `backups/pending` holds its prepared files and recovery journal while the previous recovery point remains available. Success replaces `latest`; an interrupted directory rotation is finished on the next switch. Failed writes restore the affected files/databases and remove only newly created replacement rollouts. With Codex closed, a usable unfinished journal is recovered automatically before retrying. Missing recovery sources or ambiguous old interrupted operations still produce a specific error and retain their recovery data.
 
@@ -79,7 +87,7 @@ ChatGPT snapshots and API keys stored in profiles use Windows DPAPI for the curr
 
 - Windows 10/11 x64; file-based Codex authentication (`cli_auth_credentials_store = "file"` or the current file default).
 - OpenAI-compatible Responses endpoints. Custom profiles use the saved API key via `auth.json`.
-- Current `state_5.sqlite` and JSONL rollouts. Unrecognized database versions, compressed rollouts, linked rollout paths, invalid files, and locked databases produce an error instead of a partial switch.
+- Current `state_5.sqlite` and JSONL rollouts. Reasoning repair also supports Zstandard histories; compressed provider-routing rewrites remain unsupported. Unrecognized database versions, linked paths, invalid files and locked databases produce an error instead of a partial switch.
 - Unarchived local conversations in the selected Codex home follow the selected provider. Archived conversations keep their original route. This is not per-thread provider isolation.
 - With a state DB, unindexed files are left alone. Without a DB, only unambiguous legacy histories are supported; a history cache without its state index or a paginated file without an index is rejected.
 - Config-profile or managed-policy overrides must agree with the selected route. Cloud-only chats and remote-host state are outside this local switcher's scope.
@@ -94,7 +102,7 @@ dotnet test .\CodexAuthSwitcher.sln -c Release
 powershell -NoProfile -ExecutionPolicy Bypass -File .\publish.ps1 -Configuration Release
 ```
 
-Outputs: `artifacts/publish/win-x64/CodexAuthSwitcher.exe` and `artifacts/installer/CodexAuthSwitcher-Setup-1.4.0.exe`.
+Outputs: `artifacts/publish/win-x64/CodexAuthSwitcher.exe` and `artifacts/installer/CodexAuthSwitcher-Setup-1.5.0.exe`.
 
 The regression suite uses real SQLite databases and JSONL histories to test provider round-trips, message preservation, archive/sidebar metadata, WAL backups, rollback, quoted provider names, and Windows canonical paths. It also checks read-only no-op switching, credential/settings changes with locked histories, recovery-point rotation, automatic crash recovery, and reactivated archived conversations.
 
@@ -109,7 +117,7 @@ $env:SWITCHER_SMOKE_CONTEXT = '1'
 python .\tools\ContinuitySmoke\verify.py
 ```
 
-The smoke test prints its temporary directory for inspection. Six provider switches include real resumes and verify that returning to a provider does not create redundant paginated generations. Tested with CLI 0.118.0 and Desktop backends 0.154.0-alpha.6.2 / 0.162.0-alpha.2.
+The smoke test prints its temporary directory for inspection. Six provider switches include real resumes and stable paginated generation counts. `python tools/ContinuitySmoke/verify_reasoning.py` reproduces encrypted-reasoning rejection and verifies successful repaired turns and tool context in the original and a native fork, using fake credentials and a local Responses server. Encrypted-reasoning tests use Desktop backend 0.167.0-alpha.4.1; earlier routing tests also cover CLI 0.118.0 and Desktop 0.154.0-alpha.6.2 / 0.162.0-alpha.2. Loopback tests validate request construction, not a real provider's ciphertext authentication.
 
 [Changelog](CHANGELOG.md) · [MIT License](LICENSE)
 
@@ -123,7 +131,15 @@ Codex Auth Switcher 是 Windows 上的 Codex 账号/API 切换工具，核心功
 
 [下载最新版安装包或便携版](https://github.com/letdanceintherain/Codex-Auth-Switcher/releases/latest)。
 
-### v1.4.0 修复了什么
+### v1.5.0 修复了什么
+
+- 修复从 krill 等中转切回 ChatGPT 后的加密推理 `item_id` 校验报错。跨账号、密钥、接口或模型商切换时，自动隔离旧加密推理状态；聊天正文、工具调用和结果、对话 ID、字节位置保留。
+- 增加 **“修复续聊”**：适用于已经切换、但原线程无法继续回复的情况。先结束任务并关闭 Codex，点击一次即可；不需要来回切账号，不改当前配置。修复后重新打开原对话重试。
+- 支持普通 JSONL、压缩 `.jsonl.zst` 及分支引用的父历史，只保存改动记录的压缩恢复数据，不重新备份整份聊天。没有新加密推理时，再点修复不会新增恢复点。
+- 归档和无关副本仍不处理。遇到缺失、歧义或归档父历史会在修改前提示。压缩摘要、加密消息和加密工具记录可能包含唯一上下文，因此不会被当成推理记录清除。
+- 重置的是不可可靠跨接口复用的内部推理状态，不是可见聊天内容。相同账号的正常令牌刷新、只修改模型，不会触发该重置。
+
+### 保留的 v1.4.0 路由改进
 
 - 常用的分页聊天切换不再整份复制历史文件：只等长更新开头的模型商记录，再追加一条完整的原生设置记录。恢复对话或产生新消息后，仍可继续使用同一份文件。
 - 这类文件只保存原始头部、原文件长度与本次追加记录用于恢复，避免为了切换反复备份聊天正文。
@@ -134,8 +150,8 @@ Codex Auth Switcher 是 Windows 上的 Codex 账号/API 切换工具，核心功
 继续保留此前的简化行为：
 
 - 当前配置已启用时直接提示，无文件改写、无备份，也不关闭或重启 Codex；忽略配置文件的排版差异。
-- 仅更换密钥、账号、接口地址或模型时，只更新有变化的配置或认证。会话路由一致时，不改聊天文件、不备份数据库。
-- 用只读索引检查找出需要更新模型商的未归档对话；刚取消归档的旧对话也能自动接续。归档、路由一致的对话和未被索引引用的副本跳过处理。
+- 只修改模型时不处理历史；更换密钥、账号或接口时也检查加密推理兼容性。路由一致时仍不备份数据库。
+- 用只读索引找出需要更新模型商的未归档对话；推理兼容检查还会跟踪必要的父历史。归档和无关副本跳过处理。
 - 新切换只保留一个恢复点，配置和认证不重复备份，数据库仅在需要修改时备份。
 - 关闭 Codex 后，能够根据完整恢复数据处理的中断会自动恢复，再继续切换。
 - 正常提示只显示切换结果，备份路径与同步数量放到“详细信息”。自动关闭超时会提示手动关闭，不再强制结束进程。
@@ -163,7 +179,7 @@ Codex Auth Switcher 是 Windows 上的 Codex 账号/API 切换工具，核心功
 
 ### 数据与备份
 
-程序使用同一个 `CODEX_HOME`，并遵守 `sqlite_home` 配置。只备份本次确实需要修改的配置、认证和数据库。仅换密钥时，恢复点只包含原 `auth.json`。需要同步时，兼容的分页历史只保存小型路由恢复记录；旧格式文件先备份再更新。头部容量不足或布局不兼容时，才会生成新副本并更新索引。新副本的聊天缓存会在首次恢复对话时重建，此前直接读取可能暂时没有轮次；恢复对话后历史完整显示。不会删除原有聊天或改写消息正文。
+程序使用同一个 `CODEX_HOME`，并遵守 `sqlite_home` 配置。只保存确实改动的配置、认证、数据库及推理记录恢复数据。跨账号或接口时，即使路由相同，也会检查加密推理；没有这类记录就不改历史。兼容的分页历史只保存路由小记录和发生改动的推理记录；旧格式文件仍先备份再更新。压缩历史用临时文件重压缩，解压后的字节边界不变。头部容量不足或路由布局不兼容时，仍可能生成新历史副本。不会删除原有聊天或改写消息正文。
 
 新版本的恢复点固定在 `CODEX_HOME/auth-switcher/backups/latest`。切换期间用 `pending` 保存本次准备的数据，成功后替换上一次恢复点，失败时保留恢复所需的数据。旧版本的时间戳备份及手动检查点保留，不会在升级时自动删除；新切换不再持续增加时间戳目录。
 
@@ -171,6 +187,6 @@ Codex Auth Switcher 是 Windows 上的 Codex 账号/API 切换工具，核心功
 
 恢复点可能包含聊天和认证信息，请妥善保管。新版本不会自动清理此前生成的聊天副本和旧备份：这些文件可能仍被其他对话或归档引用。兼容的分页聊天在常用切换中只增加小型设置记录，首次预留头部空间或不兼容布局仍可能增加完整副本和缓存。
 
-当前支持 Windows x64、file 认证存储、Responses 接口、`state_5.sqlite` 和 JSONL 历史。未知数据库版本、未归档的压缩历史、路径链接、文件损坏或锁定会阻止切换。未归档的本地对话会跟随当前模型商；归档、云端或远程主机对话不在同步范围内。以后需要继续归档对话时，先在 Codex 中取消归档，再切换一次即可同步。
+当前支持 Windows x64、file 认证存储、Responses 接口和 `state_5.sqlite`。推理修复支持 JSONL 及 `.jsonl.zst`，压缩文件的模型商路由改写仍受原有限制。未知数据库版本、路径链接、文件损坏、缺失父历史或锁定会阻止操作。归档、云端或远程主机对话不在同步范围内；活动对话依赖归档父历史时，也会停止并提示，不擅自修改归档。
 
 模型商本身仍需要支持对话使用的模型和工具；过期账号可能需要重新登录。构建与隔离测试方法见上方英文说明。

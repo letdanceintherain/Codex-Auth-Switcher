@@ -256,7 +256,8 @@ public sealed class CodexAuthSwitcherService
         if (!filesMatch || synchronize)
         {
             synchronizedThreads = ThreadContinuityService.Switch(_profileStore.CodexHomePath, configText, authText,
-                recovery.PendingPath, EnsureCodexClosed, synchronize);
+                recovery.PendingPath, EnsureCodexClosed, synchronize,
+                detachEncryptedReasoning: synchronize || ReplayBoundaryChanged(currentConfigText, configText, authText));
             backupPath = recovery.Complete();
         }
         if (environmentChanged)
@@ -295,6 +296,47 @@ public sealed class CodexAuthSwitcherService
         if (!File.Exists(ConfigPath))
         {
             throw new FileNotFoundException("Codex config.toml was not found.", ConfigPath);
+        }
+    }
+
+    // Explicit repair also works after an older switcher has already changed the
+    // provider, so the normal "already active" shortcut cannot hide this action.
+    public SwitchResult RepairConversationHistory()
+    {
+        EnsureConfigExists();
+        EnsureCodexClosed();
+        _profileStore.EnsureLayout();
+        using var switchLock = File.Open(Path.Combine(_profileStore.RootPath, "switch.lock"), FileMode.OpenOrCreate,
+            FileAccess.ReadWrite, FileShare.None);
+        var recovery = new RecoveryPointStore(_profileStore.BackupsPath, _profileStore.CodexHomePath);
+        recovery.Prepare(EnsureCodexClosed);
+        var count = ThreadContinuityService.Switch(_profileStore.CodexHomePath, File.ReadAllText(ConfigPath),
+            File.ReadAllText(AuthPath), recovery.PendingPath, EnsureCodexClosed, synchronizeThreads: false,
+            detachEncryptedReasoning: true);
+        if (count == 0)
+        {
+            recovery.Prepare(EnsureCodexClosed);
+            return new SwitchResult { AlreadyActive = true };
+        }
+        return new SwitchResult { SynchronizedThreads = count, BackupPath = recovery.Complete(), RestartRequired = true };
+    }
+
+    private bool ReplayBoundaryChanged(string current, string target, string targetAuth)
+    {
+        if (!File.Exists(AuthPath) || !AuthComparisonService.Equivalent(File.ReadAllText(AuthPath), targetAuth)) return true;
+        return Endpoint(current) != Endpoint(target);
+
+        static string Endpoint(string config)
+        {
+            var model = Tomlyn.TomlSerializer.Deserialize<Tomlyn.Model.TomlTable>(config)!;
+            var provider = model.TryGetValue("model_provider", out var value) ? value?.ToString() ?? "openai" : "openai";
+            string? endpoint = null;
+            if (model.TryGetValue("model_providers", out var providers) && providers is Tomlyn.Model.TomlTable table
+                && table.TryGetValue(provider, out var details) && details is Tomlyn.Model.TomlTable settings
+                && settings.TryGetValue("base_url", out var url)) endpoint = url?.ToString();
+            if (endpoint is null && provider == "openai" && model.TryGetValue("openai_base_url", out var official))
+                endpoint = official?.ToString();
+            return provider + "\n" + (endpoint?.TrimEnd('/') ?? "");
         }
     }
 

@@ -6,6 +6,12 @@ if (!Path.GetFileName(root).StartsWith("switcher-smoke-", StringComparison.Ordin
 var runtime = new FakeRuntime();
 var inspector = new LiveAuthInspector(runtime);
 var service = new CodexAuthSwitcherService(new ProfileStore(root, new ProtectedSecretStore(), inspector), inspector, runtime);
+if (args[1] == "--repair")
+{
+    var repaired = service.RepairConversationHistory();
+    Console.WriteLine($"repaired_files={repaired.SynchronizedThreads} no_op={repaired.AlreadyActive}");
+    return;
+}
 var baseUrl = Environment.GetEnvironmentVariable("SWITCHER_SMOKE_BASE_URL") ?? "http://127.0.0.1:1/v1";
 if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out var endpoint) || !endpoint.IsLoopback)
     throw new InvalidOperationException("Smoke tests require a loopback endpoint.");
